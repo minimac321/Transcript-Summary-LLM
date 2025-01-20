@@ -5,6 +5,7 @@ secrets/
 models/
 uploads/
 outputs/
+logs/
 
 # Django stuff:
 *.log
