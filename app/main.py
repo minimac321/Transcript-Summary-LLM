@@ -28,6 +28,7 @@ from langchain.utilities import WikipediaAPIWrapper
 from langchain.tools import YouTubeSearchTool
 from langchain.memory import ConversationBufferMemory
 
+import app.utils.constants as constants
 from db.db_functions import create_db, add_user_to_db, authenticate_user, get_user_id, \
     insert_into_transcripts, get_transcript_ids_and_names, get_transcript_by_id, \
     get_summary_by_id, insert_audio, get_transcript_id, get_sentiment_by_id, get_sentiment_report_by_id, \
@@ -35,22 +36,13 @@ from db.db_functions import create_db, add_user_to_db, authenticate_user, get_us
 from prompts.prompts import chat_template, fact_check_prompt, sentiment_prompt
 from templates.htmlTemplates import css, user_template, bot_template
 
-
+import utils.validation as validation
 # TODO: Segment Audion: Insert time stamps into transcription
 
 # TODO: Improve Pinecone MetaData and Organization
 
 
-def approve_password(password):
-    if len(password) >= 8 and re.search(r"(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[_@$#!?&*%])", password):
-        return True
-    return False
-    
-
-def approve_email(email):
-    email_regex = '^[a-zA-Z0-9]+[\._]?[a-zA-Z0-9]+[@]\w+[.]\w{2,3}$'
-    if re.search(email_regex, email): return True
-    else: return False
+load_dotenv()  # take environment variables from .env.
 
 
 def user_authentication_tab():
@@ -62,6 +54,8 @@ def user_authentication_tab():
         login_tab, create_account_tab = st.tabs(["Login", "Create Account"])
         with login_tab: handle_login_tab()
         with create_account_tab: handle_create_account_tab()
+        # login_tab,  = st.tabs(["Login"])
+        # with login_tab: handle_login_tab()
 
 
 def handle_login_tab():
@@ -70,7 +64,7 @@ def handle_login_tab():
     if st.button("Login") and authenticate_user(email=email,password=password):
         st.session_state.user_authenticated = True
         st.session_state.user_id = get_user_id(email=email)
-        st.experimental_rerun()
+        st.rerun()
 
 
 def handle_create_account_tab():
@@ -78,11 +72,11 @@ def handle_create_account_tab():
     new_password = st.text_input("New Password:", type='password')
     confirm_password = st.text_input("Confirm Password:", type='password')
     if st.button("Create Account"):
-        if not approve_email(new_email):
+        if not validation.approve_email(new_email):
             st.caption("Invalid Email")
             return
-        if not approve_password(new_password):
-            st.caption("Invalid Password")
+        if not validation.approve_password(new_password):
+            st.caption("Invalid Password - Must be longer than 8 characters and contain a lowercase, uppercase, number and special character")
             return
         if new_password != confirm_password:
             st.caption("Passwords do not match")
@@ -183,8 +177,8 @@ def define_tools():
     
 
 # Upload audio files for file or voice
-def upload_audio_tab():
-    global uploaded_file
+def upload_audio_tab(upload_dir):
+    # global uploaded_file
     os.makedirs(upload_dir, exist_ok=True)
     upload_mode = st.radio("Upload Mode", options=['File Upload', 'Voice Record'])
     uploaded_file = None
@@ -203,10 +197,12 @@ def upload_audio_tab():
                 fp.write(audio_bytes)
             st.audio(audio_bytes, format="audio/wav")
             uploaded_file = file_path
+            
+    return uploaded_file
 
 
 # Audio File Processing
-def process_file():
+def process_file(upload_dir: str):
     with st.spinner('Processing File...'):
         if isinstance(uploaded_file, str):
             st.session_state.audio_file_path = uploaded_file
@@ -220,14 +216,14 @@ def process_file():
 # Audio Transcription
 
 # GPT4 Audio Post Processing
-def generate_corrected_transcript(transcript):
+def generate_corrected_transcript(transcript: str, chat_comp_model: str, temperature: float):
     system_prompt = '''
         You are a helpful AI assistant, intended to fix any spelling or grammar mistakes in user audio transcript.
         \nIf words appear incorrect or there are run-on word, fix the transcript the best you can.   
     '''
     response = openai.ChatCompletion.create(
-        model=MODEL,
-        temperature=TEMP,
+        model=chat_comp_model,
+        temperature=temperature,
         messages=[
             {
                 "role": "system",
@@ -242,14 +238,18 @@ def generate_corrected_transcript(transcript):
     return response['choices'][0]['message']['content']
 
 
-def transcribe_audio():
+def transcribe_audio(chat_comp_model=constants.DEFAULT_OPENAI_LLM_MODEL_NAME, temperature: float = 0.5, transcribe_model: str = constants.DEFAULT_TRANSCRIBE_MODEL):
     with st.spinner('Transcribing Audio...'): 
         with open(st.session_state.audio_file_path, 'rb') as audio_file:
-            transcript = openai.Audio.transcribe("whisper-1", audio_file)['text']
-            st.session_state.transcript = generate_corrected_transcript(transcript)
+            transcript = openai.Audio.transcribe(transcribe_model, audio_file)['text']
+            st.session_state.transcript = generate_corrected_transcript(
+                transcript=transcript, 
+                chat_comp_model=chat_comp_model, 
+                temperature=temperature
+            )
 
 
-def display_transcript():
+def display_transcript(is_prev_tab: bool):
     with st.expander("Transcription", expanded=True):
         transcript = st.session_state.prev_transcript if is_prev_tab else st.session_state.transcript
         st.write(transcript)
@@ -257,7 +257,7 @@ def display_transcript():
 
 # Transcript Summarization
 
-def map_reduce_summarize_text(input):
+def map_reduce_summarize_text(input, llm):
     try:
         text_splitter = CharacterTextSplitter()
         texts = text_splitter.split_text(input)
@@ -267,12 +267,12 @@ def map_reduce_summarize_text(input):
     except Exception as e:
         return(f"An error occured: {e}")
 
-def summarize_transcript():
+def summarize_transcript(llm):
     with st.spinner("Generting Summary..."):
-        st.session_state.transcript_summary = map_reduce_summarize_text(st.session_state.transcript)
+        st.session_state.transcript_summary = map_reduce_summarize_text(input=st.session_state.transcript, llm=llm)
 
 
-def display_summary():
+def display_summary(is_prev_tab: bool):
     with st.expander("Summary", expanded=True):
         transcript_summary = st.session_state.prev_transcript_summary if is_prev_tab else st.session_state.transcript_summary
         st.write(transcript_summary)
@@ -280,13 +280,13 @@ def display_summary():
 
 # Fact Check Transcript
 
-def fact_check_transcript():
-    zsrd_agent = create_zrsd_agent()
+def fact_check_transcript(llm):
+    zsrd_agent = create_zrsd_agent(llm)
     with st.spinner("Fact Checking..."):
         st.session_state.fact_check = zsrd_agent.run(fact_check_prompt.format(st.session_state.transcript, st.session_state.transcript_summary))
     
 
-def display_fact_check():
+def display_fact_check(is_prev_tab):
     with st.expander("Fact Check", expanded=True):
         fact_check = st.session_state.prev_fact_check if is_prev_tab else st.session_state.fact_check
         st.write(fact_check)
@@ -294,7 +294,7 @@ def display_fact_check():
 
 # Sentiment Analysis
 
-def analyze_sentiment():
+def analyze_sentiment(llm):
     with st.spinner("Analyzing Sentiment..."):
         sentiment_chain = LLMChain(llm=llm, prompt=sentiment_prompt)
         sentiment_results = sentiment_chain.run(transcript=st.session_state.transcript, summary=st.session_state.transcript_summary).split(",")
@@ -302,7 +302,7 @@ def analyze_sentiment():
         st.session_state.sentiment_report = "".join(sentiment_results[1:])
 
 
-def display_sentiment():
+def display_sentiment(is_prev_tab: bool):
     with st.expander("Sentiment Analysis", expanded=True):
         if is_prev_tab:
             st.write(f"Sentiment Label: {st.session_state.prev_sentiment_label}")
@@ -314,7 +314,7 @@ def display_sentiment():
 
 # Vector DB QA Search
 
-def qa_search():
+def qa_search(qa):
     with st.spinner("Refering to Previous Transcripts..."):
         st.session_state.current_ai_research = qa.run(f'''
             \nReferring to previous results and information, 
@@ -322,7 +322,7 @@ def qa_search():
         ''')
 
 
-def display_qa():
+def display_qa(is_prev_tab: bool):
     with st.expander("Previous Related Information (Pinecone Retrieval QA)", expanded=True):
         ai_research = st.session_state.prev_ai_research if is_prev_tab else st.session_state.current_ai_research
         st.write(ai_research)
@@ -330,7 +330,7 @@ def display_qa():
 
 # Text Stats / Metrics
 
-def text_stats():
+def text_stats(is_prev_tab: bool):
     with st.expander("Text Statistics", expanded=True):
         transcript = st.session_state.prev_transcript if is_prev_tab else st.session_state.transcript
         st.write(f"Transcription Word Count: {len(transcript.split())}")
@@ -341,86 +341,96 @@ def text_stats():
 
 # sidebar function
 def sidebar():
-    global TEMP, MODEL
     with st.sidebar:
         with st.expander("Settings", expanded=True):
-            TEMP = st.slider(label='LLM Temperature', min_value=0.0, max_value=1.0, value=0.7)
-            MODEL = st.selectbox(label='LLM Model', options=['gpt-4','gpt-3.5-turbo'])
+            TEMPERATURE = st.slider(label='LLM Temperature', min_value=0.0, max_value=1.0, value=0.7)
+            MODEL = st.selectbox(label='LLM Model', options=constants.OPENAI_LLM_MODEL_NAMES)
+
+            return TEMPERATURE, MODEL
+
+def display_results(is_prev_tab: bool):
+    display_transcript(is_prev_tab)
+    display_summary(is_prev_tab)
+    display_fact_check(is_prev_tab)
+    display_sentiment(is_prev_tab)
+    display_qa(is_prev_tab)
+    text_stats(is_prev_tab)
 
 
-def display_results():
-    display_transcript()
-    display_summary()
-    display_fact_check()
-    display_sentiment()
-    display_qa()
-    text_stats()
+def generate_and_display_results(is_prev_tab: bool, llm, qa, chat_comp_model_name, transcribe_model, temperature):
+    transcribe_audio(chat_comp_model=chat_comp_model_name, temperature=temperature, transcribe_model=transcribe_model)
+    display_transcript(is_prev_tab)
+    summarize_transcript(llm)
+    display_summary(is_prev_tab)
+    fact_check_transcript(llm)
+    display_fact_check(is_prev_tab)
+    analyze_sentiment(llm)
+    display_sentiment(is_prev_tab)
+    qa_search(qa)
+    display_qa(is_prev_tab)
+    text_stats(is_prev_tab)
 
 
-def generate_and_display_results():
-    transcribe_audio()
-    display_transcript()
-    summarize_transcript()
-    display_summary()
-    fact_check_transcript()
-    display_fact_check()
-    analyze_sentiment()
-    display_sentiment()
-    qa_search()
-    display_qa()
-    text_stats()
-
-
-def create_zrsd_agent():
+def create_zrsd_agent(llm):
     tools = define_tools()
     memory = ConversationBufferMemory(memory_key="chat_history")
     zsrd_agent = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True, memory=memory)
     return zsrd_agent
 
 
-def create_qa():
+def create_qa(llm, index_name: str):
     embedding_function = OpenAIEmbeddings()
     vectorstore = Pinecone.from_existing_index(index_name, embedding_function)
     return VectorDBQA.from_chain_type(llm=llm,vectorstore=vectorstore)
 
 
-# Main Function
+upload_dir = 'uploads'
+index_name='transcriptions-1'
 
+# Main Function
 def main():
-    global qa,  llm, is_prev_tab, uploaded_file, upload_dir, index_name
-    upload_dir = 'uploads'
+    # global qa,  llm, is_prev_tab, uploaded_file, upload_dir, index_name
     st.set_page_config(page_title="Whisper Transcription ChatBot")
     st.write(css, unsafe_allow_html=True)
+    
     pinecone.init(api_key=os.getenv('PINECONE_API_KEY'), environment=os.getenv('PINECONE_ENVIORNMENT'))
-    index_name='index1'
+    
     create_db()
     init_session_states()
+    
     st.title("OpenAI Transcription Tool")
     user_authentication_tab()
     if st.session_state.user_authenticated:
-        sidebar()
-        llm = OpenAI(temperature=TEMP, model_name=MODEL)
+        TEMPERATURE, MODEL = sidebar()
+        llm = OpenAI(temperature=TEMPERATURE, model_name=MODEL)
         embedding_function = OpenAIEmbeddings()
-        qa =  create_qa()
+        qa = create_qa()
         chat_llm_chain = LLMChain(llm=llm, prompt=chat_template)
         create_tab, prev_tab = st.tabs(["Create Transcription","Previous Transctiptions"])
         with create_tab:
             is_prev_tab = False
-            upload_audio_tab() 
+            uploaded_file = upload_audio_tab() 
             if uploaded_file is not None:
                 if st.button("Generate Transcript and Summary"):
                     st.session_state.chat_history = []
-                    process_file()
+                    process_file(upload_dir)
                     st.subheader(st.session_state.audio_file_path.split("\\")[1])
-                    generate_and_display_results()
-                    insert_into_transcripts(file_name=(st.session_state.audio_file_path.split("\\")[1]),
-                                            transcription=st.session_state.transcript,
-                                            transcription_summary=st.session_state.transcript_summary,
-                                            sentiment_label = st.session_state.sentiment_label,
-                                            sentiment_report = st.session_state.sentiment_report,
-                                            user_id=st.session_state.user_id,
-                                            prev_ai_research=st.session_state.current_ai_research,
-                                            fact_check=st.session_state.fact_check
+                    generate_and_display_results(
+                        is_prev_tab=is_prev_tab, 
+                        llm=llm, qa=qa, 
+                        transcribe_model=constants.DEFAULT_TRANSCRIBE_MODEL,
+                        chat_comp_model_name=MODEL,
+                        temperature=TEMPERATURE
+                    )
+                    insert_into_transcripts(
+                        file_name=(st.session_state.audio_file_path.split("\\")[1]),
+                        transcription=st.session_state.transcript,
+                        transcription_summary=st.session_state.transcript_summary,
+                        sentiment_label = st.session_state.sentiment_label,
+                        sentiment_report = st.session_state.sentiment_report,
+                        user_id=st.session_state.user_id,
+                        prev_ai_research=st.session_state.current_ai_research,
+                        fact_check=st.session_state.fact_check,
                     )
                     insert_audio(file_path=st.session_state.audio_file_path, 
                                 transcript_id=get_transcript_id(file_name=(st.session_state.audio_file_path.split("\\")[1]))
@@ -432,12 +442,12 @@ def main():
                                         st.session_state.current_ai_research,
                                         st.session_state.fact_check]
                     Pinecone.from_texts(transcript_texts, embedding_function, index_name=index_name)
-                    st.experimental_rerun()
+                    st.rerun()
                         
 
                 if st.session_state.audio_file_path and st.session_state.transcript:
                     st.subheader(st.session_state.audio_file_path.split("\\")[1])
-                    display_results()     
+                    display_results(is_prev_tab)     
                     st.subheader("Chat with Transctiption")
                     user_message = st.text_input("User Message", key='unique_key1')
                     if st.button("Submit Message") and user_message:
@@ -474,7 +484,7 @@ def main():
                 # TODO: Render Previous Audio
             if st.session_state.prev_transcript:
                 st.subheader(st.session_state.prev_file_path)
-                display_results()
+                display_results(is_prev_tab)
                 st.subheader("Chat with Transctiption")
                 pc_user_message = st.text_input("User Message", key='unique_key2')
                 if st.button("Submit Message", key="button2") and pc_user_message:
@@ -495,7 +505,6 @@ def main():
 
 
 if __name__ == "__main__":
-    load_dotenv()
     openai.api_key = os.getenv("OPENAI_API_KEY")
     main()
     
