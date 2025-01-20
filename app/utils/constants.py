@@ -1,0 +1,5 @@
+
+OPENAI_LLM_MODEL_NAMES = ['gpt-4','gpt-3.5-turbo']
+DEFAULT_OPENAI_CHAT_COMP_MODEL_NAME = "'gpt-3.5-turbo'"
+
+DEFAULT_TRANSCRIBE_MODEL = "whisper-1"
