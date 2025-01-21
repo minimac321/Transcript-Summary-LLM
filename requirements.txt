@@ -9,3 +9,4 @@ langchain_community
 pinecone-client==2.2.2
 boto3==1.35.96
 tiktoken==0.8.0
+python-doc==1.1.2
