@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import tiktoken
 import ast
+from docx import Document
 
 
 from langchain.agents import initialize_agent, Tool
@@ -68,9 +69,11 @@ OPENAI_TEMPERATURE = 0.5  # Options: Float between 0 (deterministic) and 1 (crea
 write_queries_to_log_file = True
 DRY_RUN_SYSTEM = True
 LLM_LOG_FILE_NAME = "logs/llm_api_query_logs.txt"
-FULL_APP_LOG_FILE_NAME = "logs/llm_api_query_logs.txt"
+FULL_APP_LOG_FILE_NAME = "logs/full_app_output.txt"
 USD_TO_ZAR_CONVERSION = 19.10
 
+
+DEFAULT_FP_NAME = "Morgan"
 
 cost_tracker = QueryCostTracker(usd_to_zar_conversion_rate=USD_TO_ZAR_CONVERSION)
 
@@ -775,63 +778,6 @@ def process_audio_segment(chunk: List[Dict], speaker_mapping: Dict[str, str], ag
 
 
 
-# def process_audio_segment(chunk: list, speaker_mapping: dict) -> dict:
-#     """
-#     Processes a single transcript chunk using OpenAI to summarize, extract hard facts, and extract advice.
-
-#     Parameters:
-#     - chunk (list): A chunk of transcript segments.
-#     - speaker_mapping (dict): A dictionary mapping speakers to roles.
-
-#     Returns:
-#     - dict: Processed results for the chunk, including summary, hard facts, and advice.
-#     """
-#     # Combine chunk into a single transcript text
-#     chunk_text = "\n".join([f"Speaker {seg['speaker']}: {seg['text']}" for seg in chunk])
-
-#     # Define tools
-#     tools = [
-#         Tool(
-#             name="Summarize Transcript",
-#             func=lambda transcript, speaker_mapping: summarize_transcript_tool(transcript, speaker_mapping),
-#             description="Summarize the transcript by identifying key insights and main points.",
-#         ),
-#         Tool(
-#             name="Extract Hard Facts",
-#             func=lambda transcript: extract_hard_facts_tool(transcript),
-#             description="Extract hard, factual information mentioned in the transcript.",
-#         ),
-#         Tool(
-#             name="Extract Financial Advice",
-#             func=lambda transcript: extract_financial_advice_tool(transcript),
-#             description="Extract financial advice or actionable recommendations from the transcript.",
-#         ),
-#     ]
-
-#     # Initialize the agent with a fail-safe architecture
-#     try:
-#         agent = initialize_agent(
-#             tools, OpenAI(temperature=0, max_tokens=1000), agent="zero-shot-react-description", verbose=True
-#         )
-#     except Exception as e:
-#         raise RuntimeError(f"Failed to initialize the agent: {e}")
-
-#     # Run tools with arguments
-#     results = {}
-#     for tool in tools:
-#         try:
-#             if tool.name == "Summarize Transcript":
-#                 tool_result = agent.run(tool.name, transcript=chunk_text, speaker_mapping=speaker_mapping)
-#             else:
-#                 tool_result = agent.run(tool.name, transcript=chunk_text)
-#             results[tool.name.lower().replace(" ", "_")] = tool_result
-#         except Exception as e:
-#             print(f"Error running tool '{tool.name}': {e}")
-#             results[tool.name.lower().replace(" ", "_")] = None
-
-#     return results
-
-
 def generate_combined_summary(summaries: list) -> str:
     """
     Combines individual summaries into a cohesive final summary using OpenAI.
@@ -956,6 +902,70 @@ def generate_speaker_mapping(raw_transcript: dict) -> dict:
     speaker_mapping = parse_speaker_mapping(classification_output, raw_transcript['speaker_labels']['segments'])
     return speaker_mapping
     
+    
+
+def generate_clean_transcript_output(raw_transcript, speaker_mapping: dict, client_name: str, meeting_name: str, fp_name="Morgan"):
+    """
+    Generates a formatted DOCX file from a raw AWS Transcribe output.
+
+    Args:
+        raw_transcript (dict): Raw output from AWS Transcribe.
+        client_name (str): Name of the client.
+        meeting_name (str): Name of the meeting.
+        heysaturn_url (str): URL to the full notes on HeySaturn.
+        fp_name (str): Name of the FP (default is "Morgan").
+    """
+    # Initialize document
+    document = Document()
+
+    # Add metadata section
+    document.add_heading(f"Client: {client_name}", level=1)
+    document.add_paragraph(f"Date: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    document.add_paragraph(f"Meeting Name: {meeting_name}")
+    document.add_paragraph(f"Financial Planner: {fp_name}")
+    document.add_paragraph("_" * 50)
+    document.add_paragraph("Speaker Mapping:")
+    for speaker_label, speaker_name in speaker_mapping.items():
+        document.add_paragraph(f"{chr(ord('A') + list(speaker_mapping.keys()).index(speaker_label))}: {speaker_name}")
+
+    document.add_paragraph("\n")
+    document.add_paragraph("Transcript")
+    document.add_paragraph("_" * 50)
+    
+    # Combine consecutive segments by the same speaker
+    combined_segments = []
+    previous_speaker = None
+    current_transcript = ""
+
+    for segment in raw_transcript.get('audio_segments', {}):
+        speaker_label = segment.get('speaker_label')
+        transcript = segment.get('transcript')
+
+        if speaker_label == previous_speaker:
+            current_transcript += f" {transcript}"  # Append to current transcript
+        else:
+            if previous_speaker is not None:
+                combined_segments.append({"speaker_label": previous_speaker, "transcript": current_transcript})
+            previous_speaker = speaker_label
+            current_transcript = transcript
+
+    # Add the last segment
+    if previous_speaker is not None:
+        combined_segments.append({"speaker_label": previous_speaker, "transcript": current_transcript})
+
+    # Add combined transcript to the document
+    for segment in combined_segments:
+        speaker_label = segment.get('speaker_label')
+        transcript = segment.get('transcript')
+        speaker_name = chr(ord('A') + list(speaker_mapping.keys()).index(speaker_label))  # Map spk_0, spk_1, etc. to A, B, C...
+        document.add_paragraph(f"{speaker_name}: {transcript}")
+
+    # Save the document
+    filename = f"transcript_2_{meeting_name}_{datetime.now().strftime('%d-%m-%y')}.docx"
+    document.save(filename)
+    print(f"Transcript saved as {filename}")
+    
+    
 if __name__ == "__main__":
 
     # Step 1: Initialize clients and managers
@@ -988,28 +998,37 @@ if __name__ == "__main__":
     # Step 5: Fetch transcription output
     raw_transcript = transcription_manager.fetch_transcription_output(job_name)
     print(f"Successfully fetched raw transcriptions")
-
-    # Step 2: Chunk the transcript into manageable pieces
-    transcription_chunks = chunk_transcript(raw_transcript=raw_transcript, chunk_duration_s=300)
-    print(f"Number of transcription_chunks produced: {len(transcription_chunks)}")
-    print(f"Size of first chunk: {len(transcription_chunks[0])}")
-    print(transcription_chunks)
+    
 
     # Generate Speaker Mapping like so
     # speaker_mapping = generate_speaker_mapping(raw_transcript=raw_transcript)
     speaker_mapping = {'spk_0': 'financial planner', 'spk_1': 'client'}
     print("speaker_mapping:\n", speaker_mapping)
+    
+    
+    meeting_name = "Intro FP Chat with Ryan"
+    client_name = "Ryan"
+    generate_clean_transcript_output(
+        raw_transcript=raw_transcript, 
+        speaker_mapping=speaker_mapping,
+        meeting_name=meeting_name, client_name=client_name, fp_name=DEFAULT_FP_NAME
+    )
 
+    exit()
+
+    # Step 2: Chunk the transcript into manageable pieces
+    transcription_chunks = chunk_transcript(raw_transcript=raw_transcript, chunk_duration_s=300)
+    print(f"Number of transcription_chunks produced: {len(transcription_chunks)}")
+    print(f"Size of first chunk: {len(transcription_chunks[0])}")
+    print(f"First chunk: {transcription_chunks[0]}")    
+    
     for k, v in speaker_mapping.items():
         for chunk in transcription_chunks:
             for seg in chunk:
                 if seg['speaker'] == k:
                     # seg['text'] = f"{v}: {seg['text']}"
                     seg['speaker'] = v
-    
-    print(transcription_chunks)
-    
-    
+        
      # Initialize tools and agent
     agent = create_agent()
 
@@ -1033,6 +1052,6 @@ if __name__ == "__main__":
     print("Query Statistics:")
     for key, value in stats.items():
         print(f"{key}: {value}")
-        
+    
     # Log the final results
     log_final_results(final_results, stats)
