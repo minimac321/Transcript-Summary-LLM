@@ -10,7 +10,7 @@ from openai import OpenAI
 import tiktoken
 import ast
 from docx import Document
-
+import numpy as np
 
 from langchain.agents import initialize_agent, Tool
 from langchain.prompts import PromptTemplate
@@ -68,8 +68,7 @@ OPENAI_TEMPERATURE = 0.5  # Options: Float between 0 (deterministic) and 1 (crea
 # Script Parameters
 write_queries_to_log_file = True
 DRY_RUN_SYSTEM = True
-LLM_LOG_FILE_NAME = "logs/llm_api_query_logs.txt"
-FULL_APP_LOG_FILE_NAME = "logs/full_app_output.txt"
+
 USD_TO_ZAR_CONVERSION = 19.10
 
 
@@ -79,6 +78,11 @@ cost_tracker = QueryCostTracker(usd_to_zar_conversion_rate=USD_TO_ZAR_CONVERSION
 
 
 LOG_DIR = "logs"
+LLM_LOG_FILE_NAME = f"{LOG_DIR}/llm_api_query_logs.txt"
+FULL_APP_LOG_FILE_NAME = f"{LOG_DIR}/full_app_output.txt"
+
+outputs_dir = "outputs"
+transcript_out_dir = os.path.join(outputs_dir, "transcripts")
 
 
 def log_final_results(final_results, stats, log_final_file: str = FULL_APP_LOG_FILE_NAME):
@@ -394,11 +398,13 @@ def classify_roles_with_openai(transcript: str, n_speakers: int) -> dict:
 
     prompt = f"""You are an AI assistant tasked with classifying speakers in a transcript. 
 
+    A speakers tag is represented by 'spk_' followed by a counter. Examples for 3 speakers: spk_0, spk_1, spk_2.
+    
     Each speaker must be classified as either:
     - **"financial planner"**: The person asking questions, giving advice, or leading the discussion.
     - **"client"**: The person responding, asking for clarification, or describing their goals.
 
-    Your output must be a JSON object which maps each speaker (spk_) to their role in this exact format: {{"spk_0": "financial planner", "spk_1": "client", ...}}, where the number of items matches the number of unique speakers which is {n_speakers} speakers.
+    Your output must be a JSON object which maps each speaker to their role in this exact format: {{"spk_0": "financial planner", "spk_1": "client", ...}}, where the number of items matches the number of unique speakers which is {n_speakers} speakers.
 
     Transcript:
     {transcript}
@@ -542,6 +548,71 @@ def estimate_token_count(text: str, model_name: str = "gpt-3.5-turbo") -> int:
     return len(tokenizer.encode(text))
 
 
+def partition_transcription_into_chunks(speaker_segment_transcriptions: list, min_tokens: int = 500, chunk_duration_s: int = 300) -> list:
+    """
+    Splits the transcript into chunks based on minimum token size or maximum duration.
+
+    Parameters:
+    - speaker_segment_transcriptions (list): The processed list of speaker segments.
+    - min_tokens (int): Minimum number of tokens per chunk (default: 500).
+    - chunk_duration_s (int): Maximum duration of a chunk in seconds (default: 300).
+
+    Returns:
+    - list: A list of chunks, where each chunk contains text and speaker information.
+    """
+    chunks = []
+    current_chunk = []
+    current_duration = 0.0
+    current_token_count = 0
+
+    def add_chunk():
+        """Add the current chunk to the chunks list."""
+        if current_chunk:
+            chunk_text = [seg["transcript"] for seg in current_chunk]
+            chunk_speakers = [{"speaker": seg["speaker_label"]} for seg in current_chunk]
+            chunks.append({
+                "text": chunk_text,
+                "speakers": chunk_speakers,
+                "start_time": current_chunk[0]["start_time"],
+                "end_time": current_chunk[-1]["end_time"]
+            })
+
+    for segment in speaker_segment_transcriptions:
+        # Get duration and token count for the segment
+        segment_start = float(segment["start_time"])
+        segment_end = float(segment["end_time"] or segment_start)
+        segment_duration = segment_end - segment_start
+        segment_text = segment["transcript"]
+        segment_tokens = len(segment_text.split())  # Estimate token count as word count
+
+        # Add the segment to the current chunk
+        current_chunk.append(segment)
+        current_duration += segment_duration
+        current_token_count += segment_tokens
+
+        # If chunk exceeds duration or token limit, finalize it
+        if current_duration >= chunk_duration_s or current_token_count >= min_tokens:
+            add_chunk()
+            current_chunk = []
+            current_duration = 0.0
+            current_token_count = 0
+
+    # Add the last chunk if any segments remain
+    if current_chunk:
+        add_chunk()
+        
+    # Now ensure the speaker label is tagged with the speaker mapping
+    for k, v in speaker_mapping.items():
+        for chunk in chunks:
+            print(chunk)
+            for seg in chunk['speakers']:
+                if seg['speaker'] == k:
+                    seg['speaker'] = v
+
+    return chunks    
+    
+    
+    
 def chunk_transcript(raw_transcript: dict, min_tokens: int = 500, chunk_duration_s: int = 300) -> list:
     """
     Splits the transcript into chunks based on minimum token size or maximum duration.
@@ -609,7 +680,7 @@ def parse_speaker_mapping(classification_output: dict, chunk: list) -> dict:
 
     Parameters:
     - classification_output (dict): The output from the "Classify Roles" tool (e.g., {'spk_0': 'financial planner', 'spk_1': 'client'}).
-    - chunk (list): The list of transcript segments, where each segment contains 'speaker' and 'text'.
+    - chunk (list): The list of transcript segments, where each segment contains 'speaker_label' and 'transcript'.
 
     Returns:
     - dict: A dictionary mapping speaker IDs (e.g., "spk_0") to their roles (e.g., "financial planner", "client").
@@ -735,21 +806,26 @@ def process_audio_segment(chunk: List[Dict], speaker_mapping: Dict[str, str], ag
     Returns:
     - dict: Processed results for the chunk, including summary, hard facts, and advice.
     """
-    # Combine chunk into a single transcript text
-    chunk_text = "\n".join([f"Speaker {seg['speaker']}: {seg['text']}" for seg in chunk])
+    # Combine chunk into a single transcript text    
+    pre_all_chunk_text = []
+    for seg_text, speaker in zip(chunk['text'], chunk['speakers']):
+        pre_all_chunk_text.append(f"{speaker['speaker']}: {seg_text}")
     
+    all_chunk_text = "\n".join(pre_all_chunk_text)
+    print(all_chunk_text)
+        
     # Prepare JSON inputs for each tool
     summarize_input = json.dumps({
-        "transcript": chunk_text,
+        "transcript": all_chunk_text,
         "speaker_mapping": speaker_mapping
     })
     
     hard_facts_input = json.dumps({
-        "transcript": chunk_text
+        "transcript": all_chunk_text
     })
     
     financial_advice_input = json.dumps({
-        "transcript": chunk_text
+        "transcript": all_chunk_text
     })
     # Define the tool inputs
     tool_inputs = {
@@ -821,11 +897,7 @@ def generate_combined_advice(advice_list: list) -> str:
     - str: Deduplicated and consolidated advice.
     """
     advice_text = "\n".join(advice_list)
-    # prompt = f"""Deduplicate and consolidate the following financial advice points into a concise, organized bullet point list like: ['Advice 1', 'Advice 2', 'Advice 3'].
-    # Ensure there is no overlap and that the advice is clear and actionable. If there is no clear advice return 'None'. Advice to consolidate:
-    
-    # {advice_text}
-    # """
+
     prompt = f"""You are an AI assistant tasked with deduplicating and consolidating financial advice into a clear, organized list.
 
     Your goal is to:
@@ -845,6 +917,40 @@ def generate_combined_advice(advice_list: list) -> str:
         return []
     return response_msg, cost_for_query
 
+def generate_combined_hard_facts(hard_facts_list: list) -> str:
+    """
+    Combines hard facts into a concise, deduplicated bullet-point list using OpenAI.
+
+    Parameters:
+    - hard_facts_list (list): List of hard facts extracted from chunks.
+
+    Returns:
+    - str: Deduplicated and consolidated hard facts as a list.
+    """
+    hard_facts_text = "\n".join(hard_facts_list)
+
+    prompt = f"""You are an AI assistant tasked with consolidating and deduplicating a list of hard facts. 
+    A hard fact is a statement of objective truth, free from ambiguity, interpretation, or subjectivity.
+
+    Your goal is to:
+    - Extract only hard facts from the provided list, avoiding any overlap or redundancy.
+    - Ensure each fact is unique and does not repeat information stated elsewhere in the list.
+    - Exclude any subjective opinions, recommendations, or ambiguous statements.
+    - Present the final output in the format: ['Fact 1', 'Fact 2', 'Fact 3'].
+    - If no valid hard facts can be extracted, return 'None'.
+
+    Hard facts to analyze and consolidate:
+    {hard_facts_text}
+
+    Final consolidated hard facts:
+    """
+    
+    response, cost_for_query = make_openai_query(prompt, model_name=OPENAI_MODEL)
+    response_msg = response.choices[0].message.content
+    if response_msg.lower() == "none":
+        return []
+    return response_msg, cost_for_query
+
 
 def aggregate_chunk_results(chunk_results: list) -> dict:
     """
@@ -858,26 +964,26 @@ def aggregate_chunk_results(chunk_results: list) -> dict:
     - dict: Aggregated results including final summary, hard facts, goals, and advice.
     """
     # Extract and prepare data for aggregation
-    summaries = [chunk["summarized_transcript"] for chunk in chunk_results]
+    summaries = [chunk["summarize_transcript"] for chunk in chunk_results]
+    all_advice = [chunk["extract_financial_advice"] for chunk in chunk_results if chunk["extract_financial_advice"]!= []]
     all_hard_facts = [chunk["extract_hard_facts"] for chunk in chunk_results]
-    all_advice = [chunk["extract_financial_advice"] for chunk in chunk_results]
-    all_goal = [chunk["extract_goals"] for chunk in chunk_results]
+    # all_goal = [chunk["extract_goals"] for chunk in chunk_results]
     
     # Generate consolidated outputs
     final_full_summary, _ = generate_combined_summary(summaries)
     final_combined_advice, _ = generate_combined_advice(all_advice)  # Optional, can be uncommented later
+    final_combined_hard_facts, _ = generate_combined_hard_facts(all_hard_facts)  # Optional, can be uncommented later
 
     return {
         "final_full_summary": final_full_summary,
         "final_combined_advice": final_combined_advice,
-        "all_hard_facts": all_hard_facts,
+        "all_hard_facts": final_combined_hard_facts,
         # "all_goals": all_goals,
-        "all_advice": all_advice,
     }
 
 
 
-def generate_speaker_mapping(raw_transcript: dict) -> dict:
+def generate_speaker_mapping(combined_speaker_segments: List[dict]) -> dict:
     """
     Generates a speaker mapping by classifying roles in the entire transcript.
 
@@ -889,30 +995,29 @@ def generate_speaker_mapping(raw_transcript: dict) -> dict:
     """
     # Combine all segments into a single transcript text
     transcript_text = "\n".join(
-        [f"Speaker {seg['speaker_label']}: {seg['transcript']}" for seg in raw_transcript['audio_segments']]
+        [f"{seg['speaker_label']}: {seg['transcript']}" for seg in combined_speaker_segments]
     )
-    n_speakers = len(set(seg['speaker_label'] for seg in raw_transcript['audio_segments']))
+    n_speakers = len(set(seg['speaker_label'] for seg in combined_speaker_segments))
     print(f"n_speakers: {n_speakers}")
 
     # Classify roles using OpenAI
     classification_output = classify_roles_with_openai(transcript=transcript_text, n_speakers=n_speakers)
-    print("classification_output:\n", classification_output)
 
     # Parse the classification output to generate the speaker mapping
-    speaker_mapping = parse_speaker_mapping(classification_output, raw_transcript['speaker_labels']['segments'])
+    speaker_mapping = parse_speaker_mapping(classification_output, combined_speaker_segments)
     return speaker_mapping
     
     
 
-def generate_clean_transcript_output(raw_transcript, speaker_mapping: dict, client_name: str, meeting_name: str, fp_name="Morgan"):
+def create_transcript_output_docx(combined_speaker_segments: List[dict], speaker_mapping: dict, meeting_name: str, fp_name="Morgan", client_name: str = "Client A"):
     """
-    Generates a formatted DOCX file from a raw AWS Transcribe output.
+    Create a formatted DOCX file from a AWS Transcribe output.
 
     Args:
-        raw_transcript (dict): Raw output from AWS Transcribe.
+        combined_speaker_segments (dict): List of Speaker Segments with speaker and transcript as dict keys
+        speaker_mapping (dict): Mapped dictionary of speaker indices to speaker roles
         client_name (str): Name of the client.
         meeting_name (str): Name of the meeting.
-        heysaturn_url (str): URL to the full notes on HeySaturn.
         fp_name (str): Name of the FP (default is "Morgan").
     """
     # Initialize document
@@ -931,7 +1036,24 @@ def generate_clean_transcript_output(raw_transcript, speaker_mapping: dict, clie
     document.add_paragraph("\n")
     document.add_paragraph("Transcript")
     document.add_paragraph("_" * 50)
+
+    # Add combined transcript to the document
+    for segment in combined_speaker_segments:
+        speaker_label = segment.get('speaker_label')
+        transcript = segment.get('transcript')
+        speaker_name = chr(ord('A') + list(speaker_mapping.keys()).index(speaker_label))  # Map spk_0, spk_1, etc. to A, B, C...
+        document.add_paragraph(f"{speaker_name}: {transcript}")
+
+    # Save the document
+    filename = os.path.join(
+        transcript_out_dir,
+        f"transcript_{meeting_name}_{datetime.now().strftime('%d-%m-%y')}.docx"
+    )
+    document.save(filename)
+    print(f"Transcript saved as {filename}")
     
+    
+def create_combined_speaker_segments(raw_transcript: dict) -> List[dict]:
     # Combine consecutive segments by the same speaker
     combined_segments = []
     previous_speaker = None
@@ -952,20 +1074,198 @@ def generate_clean_transcript_output(raw_transcript, speaker_mapping: dict, clie
     # Add the last segment
     if previous_speaker is not None:
         combined_segments.append({"speaker_label": previous_speaker, "transcript": current_transcript})
+        
+    return combined_segments
 
-    # Add combined transcript to the document
-    for segment in combined_segments:
-        speaker_label = segment.get('speaker_label')
-        transcript = segment.get('transcript')
-        speaker_name = chr(ord('A') + list(speaker_mapping.keys()).index(speaker_label))  # Map spk_0, spk_1, etc. to A, B, C...
-        document.add_paragraph(f"{speaker_name}: {transcript}")
 
-    # Save the document
-    filename = f"transcript_2_{meeting_name}_{datetime.now().strftime('%d-%m-%y')}.docx"
-    document.save(filename)
-    print(f"Transcript saved as {filename}")
+
+def merge_transcript_speaker_breaks(raw_transcripts: dict) -> dict:
+    """
+    Merges consecutive segments in the AWS Transcribe output where the same speaker is speaking,
+    updating timestamps and preserving the format.
     
-    
+    :param raw_transcripts: Dictionary containing AWS Transcribe raw output.
+    :return: Updated dictionary with merged speaker segments.
+    """
+    merged_audio_segments = []
+    current_segment = None
+    current_items = []
+    items = raw_transcripts["items"]
+
+    # Ensure all items have an end_time by inferring from the next item's start_time
+    for i in range(len(items) - 1):
+        if "end_time" not in items[i]:
+            items[i]["end_time"] = items[i + 1]["start_time"]
+    if "end_time" not in items[-1]:  # Handle the last item
+        items[-1]["end_time"] = items[-1].get("start_time")  # Keep it as start_time if nothing else
+
+    for segment in raw_transcripts["audio_segments"]:
+        # Start a new segment if it's the first or speaker changes
+        if not current_segment or segment.get("speaker_label") != current_segment.get("speaker_label"):
+            # Save the completed segment
+            if current_segment:
+                current_segment["start_time"] = current_items[0]["start_time"]
+                current_segment["end_time"] = current_items[-1]["end_time"]
+                current_segment["transcript"] = " ".join(
+                    [item["alternatives"][0]["content"] for item in current_items]
+                )
+                current_segment["items"] = [item["id"] for item in current_items]
+                merged_audio_segments.append(current_segment)
+
+            # Start a new segment
+            current_segment = {
+                "id": len(merged_audio_segments),
+                "speaker_label": segment.get("speaker_label"),
+                "start_time": None,
+                "end_time": None,
+                "transcript": "",
+                "items": []
+            }
+            current_items = []
+
+        # Collect items for the current segment
+        for item_id in segment["items"]:
+            current_items.append(items[item_id])
+
+    # Add the final segment
+    if current_segment:
+        current_segment["start_time"] = current_items[0]["start_time"]
+        current_segment["end_time"] = current_items[-1]["end_time"]
+        current_segment["transcript"] = " ".join(
+            [item["alternatives"][0]["content"] for item in current_items]
+        )
+        current_segment["items"] = [item["id"] for item in current_items]
+        merged_audio_segments.append(current_segment)
+
+    # Update the raw_transcripts dictionary
+    raw_transcripts["audio_segments"] = merged_audio_segments
+
+    # Concatenate transcripts into logical sections for the 'transcripts' key
+    concatenated_transcripts = []
+    current_transcript = ""
+
+    for segment in merged_audio_segments:
+        # Append the current segment's transcript
+        if current_transcript:
+            current_transcript += " " + segment["transcript"]
+        else:
+            current_transcript = segment["transcript"]
+
+        # Logic to end a concatenation group (based on speaker changes or other conditions)
+        if "speaker_label" in segment:
+            concatenated_transcripts.append(current_transcript)
+            current_transcript = ""
+
+    # Add the final group if any
+    if current_transcript:
+        concatenated_transcripts.append(current_transcript)
+
+    # Update the transcripts key
+    raw_transcripts["transcripts"] = [{"transcript": t} for t in concatenated_transcripts]
+    return raw_transcripts
+
+
+
+def extract_confidence_statistics(raw_transcription: dict):
+    """
+    Extracts confidence scores, calculates averages and standard deviations for:
+    - 5-minute intervals
+    - Total transcription confidence
+    - Confidence by speaker
+
+    Parameters:
+    - raw_transcription (dict): Raw AWS Transcribe data.
+
+    Returns:
+    - dict: Statistics with confidence scores in 5-minute intervals, overall, and per speaker.
+    """
+    # Extract items and speaker information
+    items = raw_transcription["items"]
+    speaker_segments = raw_transcription["speaker_labels"]["segments"]
+
+    # Collect confidence scores with timestamps
+    confidence_scores = []
+    for item in items:
+        if "alternatives" in item and "confidence" in item["alternatives"][0]:
+            start_time = float(item["start_time"]) if "start_time" in item else None
+            end_time = float(item["end_time"]) if "end_time" in item else None
+            confidence = float(item["alternatives"][0]["confidence"])
+            confidence_scores.append({"start_time": start_time, "end_time": end_time, "confidence": confidence})
+
+    # Calculate overall confidence statistics
+    confidences = [score["confidence"] for score in confidence_scores]
+    total_avg_confidence = np.mean(confidences)
+    total_std_confidence = np.std(confidences)
+
+    # 5-minute interval confidence statistics
+    interval_confidences = []
+    interval_stats = {}
+    current_interval = 0
+    for score in confidence_scores:
+        interval_start = current_interval * 300
+        interval_end = (current_interval + 1) * 300
+
+        if score["start_time"] and interval_start <= score["start_time"] < interval_end:
+            interval_confidences.append(score["confidence"])
+        elif score["start_time"] and score["start_time"] >= interval_end:
+            # Process the completed interval
+            if interval_confidences:
+                avg_confidence = np.mean(interval_confidences)
+                std_confidence = np.std(interval_confidences)
+                interval_stats[f"Interval {current_interval}"] = {"avg": avg_confidence, "std": std_confidence}
+                interval_confidences = []
+            # Move to the next interval
+            current_interval += 1
+            if current_interval * 300 <= score["start_time"] < (current_interval + 1) * 300:
+                interval_confidences.append(score["confidence"])
+
+    # Add the last interval if not empty
+    if interval_confidences:
+        avg_confidence = np.mean(interval_confidences)
+        std_confidence = np.std(interval_confidences)
+        interval_stats[f"Interval {current_interval}"] = {"avg": avg_confidence, "std": std_confidence}
+
+    # Speaker-specific confidence statistics
+    speaker_confidences = {}
+    for segment in speaker_segments:
+        speaker_label = segment["speaker_label"]
+        segment_start = float(segment["start_time"])
+        segment_end = float(segment["end_time"])
+        segment_scores = [
+            score["confidence"]
+            for score in confidence_scores
+            if score["start_time"] and segment_start <= score["start_time"] < segment_end
+        ]
+        if speaker_label not in speaker_confidences:
+            speaker_confidences[speaker_label] = []
+        speaker_confidences[speaker_label].extend(segment_scores)
+
+    speaker_stats = {
+        speaker: {
+            "avg": np.mean(scores),
+            "std": np.std(scores),
+            "count": len(scores),
+        }
+        for speaker, scores in speaker_confidences.items()
+        if scores
+    }
+
+    # Print results
+    print("Total Transcription Confidence:")
+    print(f"Average: {total_avg_confidence:.2f}, Standard Deviation: {total_std_confidence:.2f}\n")
+    print("5-Minute Interval Confidence:")
+    for interval, stats in interval_stats.items():
+        print(f"{interval}: Avg={stats['avg']:.2f}, Std={stats['std']:.2f}")
+    print("\nSpeaker Confidence:")
+    for speaker, stats in speaker_stats.items():
+        print(f"{speaker}: Avg={stats['avg']:.2f}, Std={stats['std']:.2f}, Count={stats['count']}")
+
+    return {
+        "total_confidence": {"avg": total_avg_confidence, "std": total_std_confidence},
+        "interval_confidence": interval_stats,
+        "speaker_confidence": speaker_stats,
+    }
+
 if __name__ == "__main__":
 
     # Step 1: Initialize clients and managers
@@ -996,40 +1296,39 @@ if __name__ == "__main__":
         job_name = "transcription_job_20250120_221929"
 
     # Step 5: Fetch transcription output
-    raw_transcript = transcription_manager.fetch_transcription_output(job_name)
+    raw_transcripts = transcription_manager.fetch_transcription_output(job_name)
     print(f"Successfully fetched raw transcriptions")
     
-
-    # Generate Speaker Mapping like so
-    # speaker_mapping = generate_speaker_mapping(raw_transcript=raw_transcript)
-    speaker_mapping = {'spk_0': 'financial planner', 'spk_1': 'client'}
-    print("speaker_mapping:\n", speaker_mapping)
+    confidence_stats = extract_confidence_statistics(raw_transcription=raw_transcripts)
+    print("confidence_stats", confidence_stats)
     
+    merged_transcripts = merge_transcript_speaker_breaks(raw_transcripts=raw_transcripts)
+    combined_speaker_segments = merged_transcripts["audio_segments"]
+    print(combined_speaker_segments)
+    # combined_speaker_segments = create_combined_speaker_segments(raw_transcript=raw_transcripts)
+    # print(combined_speaker_segments)
+    
+    # Generate Speaker Mapping like so
+    # speaker_mapping = generate_speaker_mapping(combined_speaker_segments=combined_speaker_segments)
+    speaker_mapping = {'spk_0': 'financial planner', 'spk_1': 'client'}
+    print("speaker_mapping:\n", speaker_mapping)    
     
     meeting_name = "Intro FP Chat with Ryan"
     client_name = "Ryan"
-    generate_clean_transcript_output(
-        raw_transcript=raw_transcript, 
+    create_transcript_output_docx(
+        combined_speaker_segments=combined_speaker_segments, 
         speaker_mapping=speaker_mapping,
         meeting_name=meeting_name, client_name=client_name, fp_name=DEFAULT_FP_NAME
     )
 
-    exit()
-
     # Step 2: Chunk the transcript into manageable pieces
-    transcription_chunks = chunk_transcript(raw_transcript=raw_transcript, chunk_duration_s=300)
+    transcription_chunks = partition_transcription_into_chunks(speaker_segment_transcriptions=combined_speaker_segments, chunk_duration_s=300)
     print(f"Number of transcription_chunks produced: {len(transcription_chunks)}")
     print(f"Size of first chunk: {len(transcription_chunks[0])}")
     print(f"First chunk: {transcription_chunks[0]}")    
-    
-    for k, v in speaker_mapping.items():
-        for chunk in transcription_chunks:
-            for seg in chunk:
-                if seg['speaker'] == k:
-                    # seg['text'] = f"{v}: {seg['text']}"
-                    seg['speaker'] = v
+    print(f"Second chunk: {transcription_chunks[1]}")
         
-     # Initialize tools and agent
+    # Initialize tools and agent
     agent = create_agent()
 
     if agent is None:

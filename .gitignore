@@ -1,12 +1,10 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-.DS_Store
-
+#general
 secrets/
 models/
 uploads/
 outputs/
 logs/
+competitor-output/
 
 # Django stuff:
 *.log
@@ -59,3 +57,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+.DS_Store
