@@ -39,3 +39,7 @@ The Transcript-Summary-LLM application is designed to transcribe video files, ge
 - The application requires an active internet connection to perform transcription and summarization tasks using the LLM.
 
 For any issues or questions, please refer to the [setup instructions](README-SETUP.md) or contact the support team.
+
+
+Output for AWS Transcribe:
+- https://docs.aws.amazon.com/transcribe/latest/dg/how-input.html#how-output
