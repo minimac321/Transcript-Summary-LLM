@@ -1,21 +1,21 @@
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import boto3
 import openai
 import os
 import json
 from datetime import datetime
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI as OpenAIClient  # Rename to avoid conflicts
 import tiktoken
-import ast
 from docx import Document
 import numpy as np
 
 from langchain.agents import initialize_agent, Tool
-from langchain.prompts import PromptTemplate
-from langchain.llms import OpenAI
-from langchain.chains import LLMChain
+from langchain_community.llms import OpenAI as LangChainOpenAI 
+# from langchain_community.llms import OpenAI
+# from langchain_community.llms import OpenAI as LangChainOpenAI  # Use correct import
+from langchain.agents import AgentExecutor
 
 
 import sys
@@ -38,10 +38,11 @@ OPENAI_TRANSCRIPTION_PROJ_ID = "proj_Q8SXL9dUJqv3kBv3PUlotdt6"
 OPENAI_ORG_NAME = "org-3m84stKBZ07lg0LvLzHGh5Yb"
 # OPENAI_TRANSCRIPTION_PROJ_NAME = "Transcription-LLM"
 
-openai_client = OpenAI(
+openai_client = OpenAIClient(
     api_key=OPENAI_API_KEY,
-    project=OPENAI_TRANSCRIPTION_PROJ_ID,
     organization=OPENAI_ORG_NAME,
+    project=OPENAI_TRANSCRIPTION_PROJ_ID,
+
 )
 
 # AWS Credentials from environment variables
@@ -58,7 +59,7 @@ LANGUAGE_CODE = "en-ZA"  # Options: "en-US", "en-GB", "es-US", "fr-CA", etc.
 DEFAULT_TRANSCRIBE_MAX_SPEAKERS = 3
 
 # OpenAI constants
-OPENAI_MODEL = "gpt-4"  # Options: "gpt-3.5-turbo", "text-davinci-003", "text-curie-001", "gpt-4"
+OPENAI_MODEL = "gpt-3.5-turbo"  # Options: "gpt-3.5-turbo", "text-davinci-003", "text-curie-001", "gpt-4"
 OPENAI_MAX_TOKENS_SUMMARY = 300
 OPENAI_MAX_TOKENS_EXTRACTION = 300
 OPENAI_MAX_TOKENS_CLASSIFICATION = 500
@@ -67,8 +68,6 @@ OPENAI_TEMPERATURE = 0.5  # Options: Float between 0 (deterministic) and 1 (crea
 
 # Script Parameters
 write_queries_to_log_file = True
-DRY_RUN_SYSTEM = True
-
 USD_TO_ZAR_CONVERSION = 19.10
 
 
@@ -79,21 +78,31 @@ cost_tracker = QueryCostTracker(usd_to_zar_conversion_rate=USD_TO_ZAR_CONVERSION
 
 LOG_DIR = "logs"
 LLM_LOG_FILE_NAME = f"{LOG_DIR}/llm_api_query_logs.txt"
-FULL_APP_LOG_FILE_NAME = f"{LOG_DIR}/full_app_output.txt"
+
+today_date = datetime.now().strftime("%d_%b")
+FULL_APP_LOG_FILE_NAME = f"{LOG_DIR}/full_app_output_{today_date}.txt"
 
 outputs_dir = "outputs"
 transcript_out_dir = os.path.join(outputs_dir, "transcripts")
 
 
-def log_final_results(final_results, stats, log_final_file: str = FULL_APP_LOG_FILE_NAME):
+def log_final_results(final_results: dict, stats: dict, log_final_file: str = FULL_APP_LOG_FILE_NAME):
     """
     Logs the final results and statistics to a file with a timestamp.
     """
 
     with open(log_final_file, "a") as log_file:
         log_file.write(f"\n--- Log Entry: {datetime.now()} ---\n")
-        log_file.write(f"Final Results:\n{final_results}\n")
-        log_file.write(f"Statistics:\n{stats}\n")
+        log_file.write(f"Final Results:\n")
+
+        for k, v in final_results.items():
+            log_file.write(f"{k}: {v}\n")
+        
+        log_file.write(f"\n")
+        log_file.write(f"Statistics:\n")
+        for k, v in stats.items():
+            log_file.write(f"{k}: {v}\n")
+            
         log_file.write("--- End of Entry ---\n")
         
 
@@ -141,21 +150,20 @@ class TranscriptionManager:
             status = response["TranscriptionJob"]["TranscriptionJobStatus"]
             if status in ["COMPLETED", "FAILED"]:
                 break
-            print("Waiting for transcription to complete...")
-            time.sleep(10)
+            print("Waiting for transcription to complete...Wait 30 seconds")
+            time.sleep(30)
 
         if status == "FAILED":
             raise RuntimeError(f"Transcription job failed: {response}")
         return response
 
-    def fetch_transcription_output(self, job_name: str) -> dict:
+    def fetch_transcription_output(self, job_name: str, s3_output_folder: str) -> dict:
         """Fetches the transcription output JSON."""
         response = self.transcribe_client.get_transcription_job(
             TranscriptionJobName=job_name
         )
         uri = response["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
-        file_name = "other/audio-files/output/" + uri.split("/")[-1]
-        # file_name = "other/audio-files/output/" + uri.split("/")[-1]
+        file_name = s3_output_folder + uri.split("/")[-1]
         print("file_name", file_name)
         transcription_file_data = boto3.client("s3").get_object(
             Bucket=DEFAULT_BUCKET_NAME, 
@@ -172,7 +180,7 @@ def initialize_clients():
     return boto3_client, s3_manager, transcription_manager
 
 
-def upload_audio_to_s3(s3_manager, local_file_path: str, directory_name: str = "other/audio-files") -> str:
+def upload_audio_to_s3(s3_manager, local_file_path: str, directory_name: str = "other/audio-files") -> Tuple[str, str]:
     """
     Uploads an audio file to S3 and creates a structured folder hierarchy on S3.
 
@@ -185,8 +193,8 @@ def upload_audio_to_s3(s3_manager, local_file_path: str, directory_name: str = "
     - str: The S3 URL of the uploaded file.
     """
     # Get the current date in dd-mm-yy format
-    current_date = datetime.now().strftime("%d-%m-%y")
-    job_folder = f"job_{current_date}"
+    current_datetime = datetime.now().strftime("%H%M_%d-%m-%y")
+    job_folder = f"job_{current_datetime}"
 
     # Define S3 paths
     input_s3_key = f"{directory_name}/{job_folder}/input/{os.path.basename(local_file_path)}"
@@ -223,7 +231,7 @@ def upload_audio_to_s3(s3_manager, local_file_path: str, directory_name: str = "
         print(f"Error creating output folder in S3: {e}")
         raise
 
-    return f"s3://{s3_manager.bucket_name}/{input_s3_key}"
+    return f"s3://{s3_manager.bucket_name}/{input_s3_key}", output_s3_folder
 
 
 VOCABULARY_DIR = "vocabulary"
@@ -777,11 +785,11 @@ def extract_financial_advice_tool(transcript: str) -> str:
 
 
 # Initialize the agent once
-def create_agent() -> Optional:
+def create_agent() -> Optional[AgentExecutor]:
     tools = get_tools()
 
     try:
-        llm = OpenAI(temperature=0, max_tokens=1000)
+        llm = LangChainOpenAI(temperature=0, max_tokens=1000)
         agent = initialize_agent(
             tools=tools,
             llm=llm,
@@ -896,6 +904,9 @@ def generate_combined_advice(advice_list: list) -> str:
     Returns:
     - str: Deduplicated and consolidated advice.
     """
+    if len(advice_list) == 0:
+        return [], 0
+
     advice_text = "\n".join(advice_list)
 
     prompt = f"""You are an AI assistant tasked with deduplicating and consolidating financial advice into a clear, organized list.
@@ -914,8 +925,13 @@ def generate_combined_advice(advice_list: list) -> str:
     response, cost_for_query = make_openai_query(prompt, model_name=OPENAI_MODEL)
     response_msg = response.choices[0].message.content
     if response_msg.lower() == "none":
-        return []
+        return [], 0
     return response_msg, cost_for_query
+
+
+def combine_non_empty_sublists(lst):
+    combined = [item for sublist in lst if sublist for item in sublist]
+    return combined if combined else []
 
 def generate_combined_hard_facts(hard_facts_list: list) -> str:
     """
@@ -927,10 +943,15 @@ def generate_combined_hard_facts(hard_facts_list: list) -> str:
     Returns:
     - str: Deduplicated and consolidated hard facts as a list.
     """
-    hard_facts_text = "\n".join(hard_facts_list)
+    all_hard_facts = combine_non_empty_sublists(hard_facts_list)
+    if len(all_hard_facts) == 0:
+        return [], 0
+
+    hard_facts_text = "\n".join(all_hard_facts)
 
     prompt = f"""You are an AI assistant tasked with consolidating and deduplicating a list of hard facts. 
-    A hard fact is a statement of objective truth, free from ambiguity, interpretation, or subjectivity.
+    A hard fact is a statement of objective truth, free from ambiguity, interpretation, or subjectivity. The hard facts should not be about the conversation that took place, 
+    but rather about the financial information or personal information shared.
 
     Your goal is to:
     - Extract only hard facts from the provided list, avoiding any overlap or redundancy.
@@ -948,7 +969,7 @@ def generate_combined_hard_facts(hard_facts_list: list) -> str:
     response, cost_for_query = make_openai_query(prompt, model_name=OPENAI_MODEL)
     response_msg = response.choices[0].message.content
     if response_msg.lower() == "none":
-        return []
+        return [], 0
     return response_msg, cost_for_query
 
 
@@ -966,13 +987,14 @@ def aggregate_chunk_results(chunk_results: list) -> dict:
     # Extract and prepare data for aggregation
     summaries = [chunk["summarize_transcript"] for chunk in chunk_results]
     all_advice = [chunk["extract_financial_advice"] for chunk in chunk_results if chunk["extract_financial_advice"]!= []]
-    all_hard_facts = [chunk["extract_hard_facts"] for chunk in chunk_results]
+    all_hard_facts_list = [chunk["extract_hard_facts"] for chunk in chunk_results]
+    print("all_hard_facts_list", all_hard_facts_list)
     # all_goal = [chunk["extract_goals"] for chunk in chunk_results]
     
     # Generate consolidated outputs
+    final_combined_hard_facts, _ = generate_combined_hard_facts(all_hard_facts_list)  # Optional, can be uncommented later
     final_full_summary, _ = generate_combined_summary(summaries)
     final_combined_advice, _ = generate_combined_advice(all_advice)  # Optional, can be uncommented later
-    final_combined_hard_facts, _ = generate_combined_hard_facts(all_hard_facts)  # Optional, can be uncommented later
 
     return {
         "final_full_summary": final_full_summary,
@@ -1266,6 +1288,10 @@ def extract_confidence_statistics(raw_transcription: dict):
         "speaker_confidence": speaker_stats,
     }
 
+
+
+DRY_RUN_SYSTEM = False
+
 if __name__ == "__main__":
 
     # Step 1: Initialize clients and managers
@@ -1273,15 +1299,18 @@ if __name__ == "__main__":
     print(f"Initialized Client Connections Successfully")
     if not DRY_RUN_SYSTEM:
         # Step 2: Upload audio
-        s3_file_uri = upload_audio_to_s3(s3_manager, "uploads/FP Chat Morgan - 19 Jan 2025/Partial-1-18min-Audio-Clip-Ryan-Mccarlie.wav")
-        print(f"Uploaded S3 file uri: {s3_file_uri}")
+        # local_file_path = "uploads/api-test1/client_conversation.wav"
+        # local_file_path = "uploads/FP Chat Morgan - 19 Jan 2025/Partial-1-18min-Audio-Clip-Ryan-Mccarlie.wav"
+        local_file_path = "uploads/FP Chat Morgan - 19 Jan 2025/Full-Audio-Clip-Ryan-Mccarlie.wav"
+        s3_file_uri, s3_output_folder = upload_audio_to_s3(s3_manager=s3_manager, local_file_path=local_file_path)
+        print(f"Uploaded S3 file uri: {s3_file_uri}. S3 Output Path: {s3_output_folder}")
         
         try:
             # Step 3: Start transcription job
             job_name = start_aws_transcription_job(
                 transcription_manager=transcription_manager,
                 input_s3_uri=s3_file_uri,
-                output_s3_dir_prefix="other/audio-files/output/",
+                output_s3_dir_prefix=s3_output_folder,
             )
             print(f"Job name: {job_name}")
             
@@ -1293,10 +1322,11 @@ if __name__ == "__main__":
             raise e
 
     else:
-        job_name = "transcription_job_20250120_221929"
+        job_name = "transcription_job_20250218_173200"
+        s3_output_folder = "other/audio-files/job_1731_18-02-25/output/"
 
     # Step 5: Fetch transcription output
-    raw_transcripts = transcription_manager.fetch_transcription_output(job_name)
+    raw_transcripts = transcription_manager.fetch_transcription_output(job_name, s3_output_folder=s3_output_folder)
     print(f"Successfully fetched raw transcriptions")
     
     confidence_stats = extract_confidence_statistics(raw_transcription=raw_transcripts)
@@ -1309,8 +1339,8 @@ if __name__ == "__main__":
     # print(combined_speaker_segments)
     
     # Generate Speaker Mapping like so
-    # speaker_mapping = generate_speaker_mapping(combined_speaker_segments=combined_speaker_segments)
-    speaker_mapping = {'spk_0': 'financial planner', 'spk_1': 'client'}
+    speaker_mapping = generate_speaker_mapping(combined_speaker_segments=combined_speaker_segments)
+    # speaker_mapping = {'spk_0': 'financial planner', 'spk_1': 'client'}
     print("speaker_mapping:\n", speaker_mapping)    
     
     meeting_name = "Intro FP Chat with Ryan"
@@ -1326,8 +1356,7 @@ if __name__ == "__main__":
     print(f"Number of transcription_chunks produced: {len(transcription_chunks)}")
     print(f"Size of first chunk: {len(transcription_chunks[0])}")
     print(f"First chunk: {transcription_chunks[0]}")    
-    print(f"Second chunk: {transcription_chunks[1]}")
-        
+    
     # Initialize tools and agent
     agent = create_agent()
 

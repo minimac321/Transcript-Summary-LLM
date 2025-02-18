@@ -60,8 +60,8 @@ class QueryCostTracker:
             dict: Dictionary containing total cost, average cost, and total cost in ZAR.
         """
         return {
-            "total_cost_usd": self.get_full_amount().round(6),
-            "total_cost_zar": self.get_cost_in_rands().round(6),
-            "average_cost_per_query_usd": self.get_average_cost_per_query().round(6),
+            "total_cost_usd": round(self.get_full_amount(), 6),
+            "total_cost_zar": round(self.get_cost_in_rands(), 6),
+            "average_cost_per_query_usd": round(self.get_average_cost_per_query(), 6),
             "query_count": self.query_count,
         }
