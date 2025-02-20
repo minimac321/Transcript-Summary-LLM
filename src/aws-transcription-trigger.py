@@ -1,32 +1,31 @@
-import time
-from typing import Dict, List, Optional, Tuple
-import boto3
 import openai
 import os
 import json
+import re
+import time
+import sys
+import numpy as np
 from datetime import datetime
 from dotenv import load_dotenv
-from openai import OpenAI as OpenAIClient  # Rename to avoid conflicts
-import tiktoken
+from openai import OpenAI as OpenAIClient
+import google.generativeai as genai
+from vertexai.preview.generative_models import GenerativeModel
+from vertexai import init
+
 from docx import Document
-import numpy as np
+from typing import Dict, List, Optional, Tuple
 
 from langchain.agents import initialize_agent, Tool
 from langchain_community.llms import OpenAI as LangChainOpenAI 
-# from langchain_community.llms import OpenAI
-# from langchain_community.llms import OpenAI as LangChainOpenAI  # Use correct import
 from langchain.agents import AgentExecutor
 
-
-import sys
-current_directory = os.getcwd()
-sys.path.append(current_directory)
-app_dir = os.path.join(current_directory, "app")
-sys.path.append(app_dir)
-
-
-from app.utils.cost_tracker import QueryCostTracker
-
+from aws_utils import initialize_clients, start_aws_transcription_job, upload_audio_to_s3
+from constants import DEFAULT_FP_NAME, GCP_LOCATION, GCP_PROJECT_ID, GEMINI_MODEL_NAMES_LIST, GEMINI_PRICING_DICT, MODEL_TOKEN_LIMITS, OPENAI_MODEL_NAMES_LIST, OPENAI_ORG_NAME, OPENAI_PRICING_DICT, OPENAI_TRANSCRIPTION_PROJ_ID, USD_TO_ZAR_CONVERSION
+from gemini_llm_functions import SpeakerClassification, SpeakerLabel, make_gemini_query
+from log_utils import log_final_results
+from openai_llm_functions import make_openai_query
+from utils import count_tokens_func, split_text_into_chunks
+from cost_tracker import QueryCostTracker
 
 # Load .env variables
 load_dotenv("app/.env")
@@ -34,50 +33,27 @@ load_dotenv("app/.env")
 # Initialize OpenAI API key (replace with your key)
 openai.api_key = os.getenv("OPENAI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_TRANSCRIPTION_PROJ_ID = "proj_Q8SXL9dUJqv3kBv3PUlotdt6"
-OPENAI_ORG_NAME = "org-3m84stKBZ07lg0LvLzHGh5Yb"
+
 # OPENAI_TRANSCRIPTION_PROJ_NAME = "Transcription-LLM"
 
 openai_client = OpenAIClient(
     api_key=OPENAI_API_KEY,
     organization=OPENAI_ORG_NAME,
     project=OPENAI_TRANSCRIPTION_PROJ_ID,
-
 )
 
 # AWS Credentials from environment variables
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
-# AWS default settings
-DEFAULT_REGION_NAME = "us-west-2"
-DEFAULT_BUCKET_NAME = "digital-resume-s3"
-
-# AWS Transcribe constants
-MEDIA_FORMAT = "wav"  # Options: "wav", "mp3", "mp4", "flac"
-LANGUAGE_CODE = "en-ZA"  # Options: "en-US", "en-GB", "es-US", "fr-CA", etc.
-DEFAULT_TRANSCRIBE_MAX_SPEAKERS = 3
-
-# OpenAI constants
-OPENAI_MODEL = "gpt-3.5-turbo"  # Options: "gpt-3.5-turbo", "text-davinci-003", "text-curie-001", "gpt-4"
-OPENAI_MAX_TOKENS_SUMMARY = 300
-OPENAI_MAX_TOKENS_EXTRACTION = 300
-OPENAI_MAX_TOKENS_CLASSIFICATION = 500
-OPENAI_TEMPERATURE = 0.5  # Options: Float between 0 (deterministic) and 1 (creative)
-
-
-# Script Parameters
-write_queries_to_log_file = True
-USD_TO_ZAR_CONVERSION = 19.10
-
-
-DEFAULT_FP_NAME = "Morgan"
-
-cost_tracker = QueryCostTracker(usd_to_zar_conversion_rate=USD_TO_ZAR_CONVERSION)
+# Initialize Gemini API
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+init(project=GCP_PROJECT_ID, location=GCP_LOCATION)  # Set the correct region
 
 
 LOG_DIR = "logs"
 LLM_LOG_FILE_NAME = f"{LOG_DIR}/llm_api_query_logs.txt"
+# LLM_LOG_FILE_NAME = f"{LOG_DIR}/gemini_api_log.txt"
 
 today_date = datetime.now().strftime("%d_%b")
 FULL_APP_LOG_FILE_NAME = f"{LOG_DIR}/full_app_output_{today_date}.txt"
@@ -86,407 +62,167 @@ outputs_dir = "outputs"
 transcript_out_dir = os.path.join(outputs_dir, "transcripts")
 
 
-def log_final_results(final_results: dict, stats: dict, log_final_file: str = FULL_APP_LOG_FILE_NAME):
-    """
-    Logs the final results and statistics to a file with a timestamp.
-    """
+cost_tracker = QueryCostTracker(
+    usd_to_zar_conversion_rate=USD_TO_ZAR_CONVERSION,
+    nth_decimal_point=8
+)
 
-    with open(log_final_file, "a") as log_file:
-        log_file.write(f"\n--- Log Entry: {datetime.now()} ---\n")
-        log_file.write(f"Final Results:\n")
+#########################
+### SCRIPT PARAMETERS ###
+#########################
+DRY_RUN_SYSTEM = True
+SELECTED_MODEL = "gemini-1.5-flash"
 
-        for k, v in final_results.items():
-            log_file.write(f"{k}: {v}\n")
-        
-        log_file.write(f"\n")
-        log_file.write(f"Statistics:\n")
-        for k, v in stats.items():
-            log_file.write(f"{k}: {v}\n")
-            
-        log_file.write("--- End of Entry ---\n")
-        
 
-class Boto3Client:
-    """Manages Boto3 client connections."""
-    def __init__(self, region: str = DEFAULT_REGION_NAME):
-        self.transcribe_client : boto3.client = boto3.client(
-            "transcribe",
-            region_name=region,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+def make_llm_query(prompt: str, model_name: str, log_file: str) -> Tuple[str, float]:
+    if model_name in GEMINI_MODEL_NAMES_LIST:
+        response, cost_for_query = make_gemini_query(
+            prompt=prompt, model_name=model_name, 
+            cost_tracker=cost_tracker,
+            gemini_pricing_dict=GEMINI_PRICING_DICT, log_file=log_file,
         )
-        self.s3_client = boto3.client(
-            "s3",
-            region_name=region,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        )
-
-class S3Manager:
-    """Handles S3 operations."""
-    def __init__(self, boto3_client: Boto3Client, bucket_name: str = DEFAULT_BUCKET_NAME):
-        self.s3_client = boto3_client.s3_client
-        self.bucket_name = bucket_name
-
-    def upload_file(self, local_file_path: str, s3_key: str) -> str:
-        """Uploads a file to S3 and returns the S3 URI."""
-        self.s3_client.upload_file(local_file_path, self.bucket_name, s3_key)
-        return f"s3://{self.bucket_name}/{s3_key}"
-
-class TranscriptionManager:
-    """Manages transcription jobs."""
-    def __init__(self, boto3_client: Boto3Client):
-        self.transcribe_client = boto3_client.transcribe_client
-        
-    def get_client(self) -> boto3.client:
-        return self.transcribe_client
-
-    def wait_for_transcription_completion(self, job_name: str):
-        """Waits until the transcription job completes."""
-        while True:
-            response = self.transcribe_client.get_transcription_job(
-                TranscriptionJobName=job_name
-            )
-            status = response["TranscriptionJob"]["TranscriptionJobStatus"]
-            if status in ["COMPLETED", "FAILED"]:
-                break
-            print("Waiting for transcription to complete...Wait 30 seconds")
-            time.sleep(30)
-
-        if status == "FAILED":
-            raise RuntimeError(f"Transcription job failed: {response}")
-        return response
-
-    def fetch_transcription_output(self, job_name: str, s3_output_folder: str) -> dict:
-        """Fetches the transcription output JSON."""
-        response = self.transcribe_client.get_transcription_job(
-            TranscriptionJobName=job_name
-        )
-        uri = response["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
-        file_name = s3_output_folder + uri.split("/")[-1]
-        print("file_name", file_name)
-        transcription_file_data = boto3.client("s3").get_object(
-            Bucket=DEFAULT_BUCKET_NAME, 
-            Key=file_name,
-        )
-        transcription_data = json.loads(transcription_file_data["Body"].read())['results']
-        return transcription_data
-
-def initialize_clients():
-    """Initializes S3 and Transcription clients."""
-    boto3_client = Boto3Client()
-    s3_manager = S3Manager(boto3_client)
-    transcription_manager = TranscriptionManager(boto3_client)
-    return boto3_client, s3_manager, transcription_manager
-
-
-def upload_audio_to_s3(s3_manager, local_file_path: str, directory_name: str = "other/audio-files") -> Tuple[str, str]:
-    """
-    Uploads an audio file to S3 and creates a structured folder hierarchy on S3.
-
-    Parameters:
-    - s3_manager: An S3 manager object with `s3_client` and `bucket_name`.
-    - local_file_path (str): The path of the local file to upload.
-    - directory_name (str): The base directory path inside the S3 bucket. Default is "other/audio-files".
-
-    Returns:
-    - str: The S3 URL of the uploaded file.
-    """
-    # Get the current date in dd-mm-yy format
-    current_datetime = datetime.now().strftime("%H%M_%d-%m-%y")
-    job_folder = f"job_{current_datetime}"
-
-    # Define S3 paths
-    input_s3_key = f"{directory_name}/{job_folder}/input/{os.path.basename(local_file_path)}"
-    output_s3_folder = f"{directory_name}/{job_folder}/output/"
-
-    s3_client = s3_manager.s3_client
-
-    # Check if the file already exists in S3
-    try:
-        s3_client.head_object(Bucket=s3_manager.bucket_name, Key=input_s3_key)
-        print(f"File already exists in S3: s3://{s3_manager.bucket_name}/{input_s3_key}")
-        return f"s3://{s3_manager.bucket_name}/{input_s3_key}"
-    except s3_client.exceptions.ClientError as e:
-        if e.response['Error']['Code'] == "404":
-            print(f"File does not exist in S3. Proceeding with upload.")
-            # pass
-        else:
-            print(f"Error checking file in S3: {e}")
-            raise
-
-    # Upload the file to the input directory on S3
-    try:
-        s3_client.upload_file(local_file_path, s3_manager.bucket_name, input_s3_key)
-        print(f"Uploaded to S3: s3://{s3_manager.bucket_name}/{input_s3_key}")
-    except Exception as e:
-        print(f"Error uploading file to S3: {e}")
-        raise
-
-    # Create the output folder on S3 (S3 "folders" are just keys that end with '/')
-    try:
-        s3_client.put_object(Bucket=s3_manager.bucket_name, Key=output_s3_folder)
-        print(f"Created output folder in S3: s3://{s3_manager.bucket_name}/{output_s3_folder}")
-    except Exception as e:
-        print(f"Error creating output folder in S3: {e}")
-        raise
-
-    return f"s3://{s3_manager.bucket_name}/{input_s3_key}", output_s3_folder
-
-
-VOCABULARY_DIR = "vocabulary"
-TRANSCRIBE_VOCABULARY_FILE = f"{VOCABULARY_DIR}/FP-SA-Vocab-V1.csv"
-
-
-
-def upload_vocabulary_files(transcribe_client, vocab_name: str, vocab_file: str):
-    """
-    Uploads a custom vocabulary file to AWS Transcribe.
-
-    Parameters:
-    - transcribe_client: The AWS Transcribe client.
-    - vocab_name (str): The name of the vocabulary to create or update.
-    - vocab_file (str): The local file path of the vocabulary CSV.
-
-    Returns:
-    - None
-    """
-    try:
-        # Check if the vocabulary already exists
-        response = transcribe_client.get_vocabulary(VocabularyName=vocab_name)
-        if response['VocabularyState'] in ['READY', 'PENDING']:
-            print(f"Vocabulary '{vocab_name}' already exists and is ready or pending. Skipping upload.")
-            return
-    except transcribe_client.exceptions.BadRequestException:
-        print(f"Vocabulary '{vocab_name}' does not exist. Proceeding to create it.")
-
-
-    raise("Error: I need to setup uploading file in .txt form to s3 first - Phrases does not work. Use VocabularyFileUri instead")
-    # Upload vocabulary
-    with open(vocab_file, 'r') as file:
-        vocab_content = file.read()
-
-    try:
-        transcribe_client.create_vocabulary(
-            VocabularyName=vocab_name,
-            LanguageCode=LANGUAGE_CODE,
-            Phrases=vocab_content.splitlines(),
-        )
-        print(f"Vocabulary '{vocab_name}' has been uploaded successfully.")
-    except Exception as e:
-        print(f"Error uploading vocabulary '{vocab_name}': {e}")
-        raise
-
-
-def start_aws_transcription_job(transcription_manager, input_s3_uri: str, output_s3_dir_prefix: str) -> str:
-    """Starts a transcription job and returns the job name."""
-    transcribe_client = transcription_manager.transcribe_client
-    # Upload custom vocabularies
-    upload_vocabulary_files(transcribe_client, "FP-SA-Vocab-V1", TRANSCRIBE_VOCABULARY_FILE)
-
-    job_name = f"transcription_job_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    try:
-        transcribe_client.start_transcription_job(
-            TranscriptionJobName=job_name,
-            Media={"MediaFileUri": input_s3_uri},
-            MediaFormat=MEDIA_FORMAT,
-            LanguageCode=LANGUAGE_CODE,
-            OutputBucketName=DEFAULT_BUCKET_NAME,
-            OutputKey=output_s3_dir_prefix,
-            Settings={
-                "ShowSpeakerLabels": True,
-                "MaxSpeakerLabels": DEFAULT_TRANSCRIBE_MAX_SPEAKERS,
-                "ShowAlternatives": False,
-                "VocabularyName": "FP-SA-Vocab-V1",
-            },
-        )
-        print(f"Transcription job '{job_name}' started successfully.")
-        return job_name
-    except Exception as e:
-        print(f"Error starting transcription job '{job_name}': {e}")
-        raise
-
-
-def calculate_openai_cost(messages, response_raw, model_name=OPENAI_MODEL) -> float:
-    """
-    Calculate the estimated cost of an OpenAI API call in dollars.
-
-    Args:
-        messages (list): The input messages sent to OpenAI, including roles and content.
-        response_raw (dict): The raw response from OpenAI's API call.
-        model_name (str): The model used for the API call. Defaults to "gpt-3.5-turbo".
-
-    Returns:
-        float: The estimated cost of the query in USD.
-    """
-    # Pricing per 1,000 tokens (adjust these based on OpenAI's pricing structure)
-    pricing = {
-        "gpt-3.5-turbo": {"input": 0.0015, "output": 0.0020},  # USD per 1,000 tokens
-        "gpt-4": {"input": 0.03, "output": 0.06},             # USD per 1,000 tokens
-    }
-
-    # Tokenizer setup
-    model_encodings = {
-        "gpt-3.5-turbo": "cl100k_base",
-        "gpt-4": "cl100k_base",
-    }
-
-    if model_name not in pricing or model_name not in model_encodings:
-        raise ValueError(f"Unsupported model: {model_name}")
-
-    # Get tokenizer
-    tokenizer = tiktoken.get_encoding(model_encodings[model_name])
-
-    # Calculate input tokens
-    input_text = " ".join([msg["content"] for msg in messages])
-    input_tokens = len(tokenizer.encode(input_text))
-
-    # Calculate output tokens
-    output_text = response_raw.choices[0].message.content
-    output_tokens = len(tokenizer.encode(output_text))
-
-    # Calculate total cost
-    input_cost = (input_tokens / 1000) * pricing[model_name]["input"]
-    output_cost = (output_tokens / 1000) * pricing[model_name]["output"]
-    total_cost = input_cost + output_cost
-
-    return total_cost
-
-
-def log_query(prompt, response_msg, cost_for_query, model_name, log_file=LLM_LOG_FILE_NAME):
-    with open(log_file, "a") as log:
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "model": model_name,
-            "prompt": prompt,
-            "response": response_msg,
-            "cost_usd": round(cost_for_query, 6),
-        }
-        log.write(json.dumps(log_entry) + "\n")
-        
-        
-def make_openai_query(prompt, model_name=OPENAI_MODEL, log_file=LLM_LOG_FILE_NAME):
-    """
-    Make a query to the OpenAI API and return the response.
-
-    Args:
-        prompt (str): The prompt for the query.
-        model_name (str): The model used for the API call. Defaults to "gpt-3.5-turbo".
-
-    Returns:
-        dict: The response from the OpenAI API.
-    """
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": prompt}
-    ]
-    response = openai.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        max_tokens=int(OPENAI_MAX_TOKENS_CLASSIFICATION*1.3),
-        temperature=OPENAI_TEMPERATURE,
-    )
-    # Extract response content
-    response_msg = response.choices[0].message.content
-    # Estimate Cost
-    cost_for_query = calculate_openai_cost(messages=messages, response_raw=response, model_name=OPENAI_MODEL)
-    cost_tracker.record_query_cost(cost_for_query)
+        return response, cost_for_query
     
-    # Log the query and response
-    if write_queries_to_log_file:
-        log_query(prompt, response_msg, cost_for_query, model_name, log_file=log_file)
+    elif model_name in OPENAI_MODEL_NAMES_LIST:
+        response, cost_for_query = make_openai_query(
+            prompt=prompt, model_name=model_name, 
+            cost_tracker=cost_tracker,
+            openai_pricing_dict=OPENAI_PRICING_DICT, log_file=log_file,
+        )
+        return response, cost_for_query
     
-    return response, cost_for_query
-    
-    
+    else:
+        print("(ERROR) - Model is not part of OpenAI or Gemini models")
+        assert False
 
-def classify_roles_with_openai(transcript: str, n_speakers: int) -> dict:
-    """Classify roles in transcript"""
+def classify_speakers_api_call(n_speakers: int, transcript: str):
+    prompt = f"""You are an AI assistant tasked with classifying speakers in a transcript.
 
-    prompt = f"""You are an AI assistant tasked with classifying speakers in a transcript. 
+    A speaker's tag is represented by 'spk_' followed by a counter. Examples for 3 speakers: spk_0, spk_1, spk_2.
 
-    A speakers tag is represented by 'spk_' followed by a counter. Examples for 3 speakers: spk_0, spk_1, spk_2.
-    
-    Each speaker must be classified as either:
-    - **"financial planner"**: The person asking questions, giving advice, or leading the discussion.
-    - **"client"**: The person responding, asking for clarification, or describing their goals.
+    Each speaker must be classified ONCE as either:
+    - **{SpeakerLabel.FINANCIAL_PLANNER.value}**: The person asking questions, giving advice, or leading the discussion.
+    - **{SpeakerLabel.CLIENT.value}**: The person responding, asking for clarification, or describing their goals.
 
-    Your output must be a JSON object which maps each speaker to their role in this exact format: {{"spk_0": "financial planner", "spk_1": "client", ...}}, where the number of items matches the number of unique speakers which is {n_speakers} speakers.
+    Your response must be **valid JSON only** with no extra text or formatting.  
+    The output format **must match this exactly**:
+    {{
+        "spk_0": {SpeakerLabel.FINANCIAL_PLANNER.value},
+        "spk_1": {SpeakerLabel.CLIENT.value},
+        "spk_2": {SpeakerLabel.CLIENT.value}
+    }}
+    Ensure that the number of entries matches exactly {n_speakers} unique speakers.
 
-    Transcript:
+    ### **Transcript:**
     {transcript}
 
-    Output:
+    ### **Output (Strict JSON Format Only, No Extra Text):**
     """
-    response, _ = make_openai_query(prompt, model_name=OPENAI_MODEL)
-    return json.loads(response.choices[0].message.content)
+    model = genai.GenerativeModel(SELECTED_MODEL)
+    response = model.generate_content(
+        contents=prompt,
+        generation_config={
+            'response_mime_type': 'application/json',
+        },
+    )
+    # Parse JSON and assert correctness
+    try:
+        speaker_mapping = json.loads(response.text.strip())  # Clean and parse JSON
+        
+        # Validate keys and values
+        pattern = r'^spk_\d+$'
+        assert all(
+            re.match(pattern, key) and value in {SpeakerLabel.FINANCIAL_PLANNER.value, SpeakerLabel.CLIENT.value} 
+            for key, value in speaker_mapping.items()
+        )
+        return speaker_mapping
+    except json.JSONDecodeError as e:
+        print("Error parsing JSON response:", e)
+        return None
+    except Exception as e:
+        print("Validation error:", e)
+        return None
 
 
 def summarize_transcript_with_mapping(transcript: str, speaker_mapping: dict) -> str:
-    """Summarise transcript using speaker mapping."""
+    """Summarizes a transcript using speaker mapping to distinguish roles and key insights."""
+
     prompt = f"""
-    You are an AI assistant summarizing a transcript based on speaker roles. Use the following speaker mapping to identify roles: {speaker_mapping}. 
+    You are an AI assistant summarizing a financial discussion based on speaker roles. Use the following speaker mapping to correctly identify each role: {speaker_mapping}. 
 
-    Your summary must:
-    - Be in third person and concise.
-    - Clearly differentiate between what the "financial planner" (advisor) and "client" (client) said.
-    - Highlight advice, questions, and goals mentioned.
-
-    Transcript:
+    ### **Instructions:**
+    - **Write in third person** with a professional, neutral tone.
+    - **Clearly differentiate** between what the **financial planner (advisor)** and the **client** said.
+    - **Summarize the key points** of the conversation, focusing on:
+      - **Client's financial goals** (e.g., savings, investments, debt plans).
+      - **Advice provided by the financial planner** (recommendations, strategies, clarifications).
+      - **Important questions or concerns raised** by the client.
+    - **Avoid unnecessary details** and keep the summary concise and well-structured.
+    
+    ### **Transcript:**
     {transcript}
 
-    Summary:
-    """
-    response, _ = make_openai_query(prompt, model_name=OPENAI_MODEL)
-    return response.choices[0].message.content
+    ### **Summarized Conversation:**
+    """ 
+    response, _ = make_llm_query(prompt=prompt, model_name=SELECTED_MODEL, log_file=LLM_LOG_FILE_NAME)
+    return response
 
-def extract_goals_with_openai(transcript: str) -> list:
-    """Extracts client goals from the transcript."""
-    prompt = f"""You are an AI assistant tasked with extracting goals mentioned by the client in a transcript. 
+def extract_goals_with_llm(transcript: str) -> list:
+    """Extracts client-stated financial goals from the transcript while ignoring planner advice or general statements."""
 
-    Your output must:
-    - Be a list of client goals, each as a short and specific statement.
-    - Ignore any unrelated information or advice provided by the financial planner.
-    - Return "None" if no hard facts are mentioned.
+    prompt = f"""You are an AI assistant tasked with extracting **clear, specific financial goals** directly mentioned by the client in a transcript.
 
-    Transcript:
+    A **financial goal** is:
+    - A **specific, actionable objective** the client intends to achieve (e.g., "Save $20,000 for a home" or "Pay off my student loans").
+    - **Personal to the client**, reflecting their aspirations, priorities, or long-term financial plans.
+    - **Not general financial advice, planner recommendations, or industry trends.**
+    - **Not vague statements**—goals must be well-defined.
+
+    Your task:
+    - **Extract only the client's goals** (not the financial planner's advice or general discussions).
+    - **Ensure goals are concise and properly formatted as a list of goals. For Example: ["Goal 1", "Goal 2", ..].**
+    - **Ignore unrelated information, financial advice, or general facts.**
+    - **Return "None" if no client goals are mentioned.**
+
+    ### **Transcript:**
     {transcript}
 
-    Client Goals:
+    ### **Extracted Client Goals:**
     - 
     """
-    response, _ = make_openai_query(prompt, model_name=OPENAI_MODEL)
-    response_msg = response.choices[0].message.content
+    response_msg, _ = make_llm_query(prompt=prompt, model_name=SELECTED_MODEL, log_file=LLM_LOG_FILE_NAME)
     if response_msg.lower() == "none":
         return []
     return response_msg
 
-def extract_hard_facts_with_openai(transcript: str) -> list:
-    """Extracts hard financial facts."""
-    prompt = f"""You are an AI assistant tasked with extracting hard financial facts mentioned in a transcript.
+def extract_hard_facts_with_llm(transcript: str) -> list:
+    """Extracts hard financial facts while ensuring general information not specific to the client's situation is excluded."""
+    
+    prompt = f"""You are an AI assistant tasked with extracting **hard financial facts** mentioned in a transcript.
 
     Hard facts are:
-    - Objective and verifiable financial details (e.g., account balances, tax percentages, financial commitments, or investment products mentioned).
-    - Not advice, opinions, or goals.
+    - **Objective and verifiable financial details** directly linked to the client's financial or personal situation.
+    - Includes **account balances, specific tax details affecting the client, investment products owned or considered, financial commitments, or precise monetary figures.**
+    - **Does not include general financial knowledge, tax laws, or statistics that are not specific to the client.**
+    - Not advice, opinions, or financial goals.
 
     Your output must:
-    - Be a list of financial facts.
-    - Return "None" if no hard facts are mentioned.
+    - Be a **list of hard financial facts**.
+    - Exclude any general financial knowledge that does not relate to the client.
+    - Return "None" if no relevant hard facts are mentioned.
 
-    Transcript:
+    ### **Transcript:**
     {transcript}
 
-    Hard Financial Facts:
+    ### **Extracted Hard Financial Facts:**
     - 
     """
-    response, _ = make_openai_query(prompt, model_name=OPENAI_MODEL)
-    response_msg = response.choices[0].message.content
+    response_msg, _ = make_llm_query(prompt=prompt, model_name=SELECTED_MODEL, log_file=LLM_LOG_FILE_NAME)
     if response_msg.lower() == "none":
         return []
     return response_msg
 
-def extract_financial_advice_with_openai(transcript: str) -> list:
+def extract_financial_advice_with_llm(transcript: str) -> list:
     """Extracts financial advice."""
     prompt = f"""You are an AI assistant tasked with extracting financial advice provided by the financial planner in a transcript.
 
@@ -504,8 +240,7 @@ def extract_financial_advice_with_openai(transcript: str) -> list:
     Financial Advice:
     - 
     """
-    response, _ = make_openai_query(prompt, model_name=OPENAI_MODEL)
-    response_msg = response.choices[0].message.content
+    response_msg, _ = make_llm_query(prompt=prompt, model_name=SELECTED_MODEL, log_file=LLM_LOG_FILE_NAME)
     if response_msg.lower() == "none":
         return []
     return response_msg
@@ -612,7 +347,6 @@ def partition_transcription_into_chunks(speaker_segment_transcriptions: list, mi
     # Now ensure the speaker label is tagged with the speaker mapping
     for k, v in speaker_mapping.items():
         for chunk in chunks:
-            print(chunk)
             for seg in chunk['speakers']:
                 if seg['speaker'] == k:
                     seg['speaker'] = v
@@ -680,38 +414,6 @@ def chunk_transcript(raw_transcript: dict, min_tokens: int = 500, chunk_duration
         add_chunk()
 
     return chunks
-    
-
-def parse_speaker_mapping(classification_output: dict, chunk: list) -> dict:
-    """
-    Parses the output of the 'Classify Roles' tool into a speaker mapping dictionary.
-
-    Parameters:
-    - classification_output (dict): The output from the "Classify Roles" tool (e.g., {'spk_0': 'financial planner', 'spk_1': 'client'}).
-    - chunk (list): The list of transcript segments, where each segment contains 'speaker_label' and 'transcript'.
-
-    Returns:
-    - dict: A dictionary mapping speaker IDs (e.g., "spk_0") to their roles (e.g., "financial planner", "client").
-    """
-    if not isinstance(classification_output, dict):
-        raise ValueError("Invalid classification output format. Expected a dictionary.")
-
-    speaker_mapping = {}
-    for segment in chunk:
-        speaker = segment['speaker_label']  # e.g., "spk_0", "spk_1"
-        if speaker in classification_output:
-            role = classification_output[speaker]
-            if speaker in speaker_mapping:
-                # Check for role conflicts
-                if speaker_mapping[speaker] != role:
-                    print(f"Warning: Speaker '{speaker}' was previously assigned as '{speaker_mapping[speaker]}' and is now being reassigned to '{role}'.")
-            else:
-                speaker_mapping[speaker] = role
-        else:
-            print(f"Warning: Speaker '{speaker}' not found in classification output.")
-
-    return speaker_mapping
-
 
 
 # Initialize the tools
@@ -741,6 +443,14 @@ def get_tools() -> List[Tool]:
                 "Input should be the transcript as a single string."
             ),
         ),
+        Tool(
+            name="Extract Financial Goals",
+            func=extract_financial_goals_tool,
+            description=(
+                "Extract financial goals from the client or financial adviser from the transcript. "
+                "Input should be the transcript as a single string."
+            ),
+        ),
     ]
 
 # Define your tool functions with a single input argument
@@ -765,7 +475,7 @@ def extract_hard_facts_tool(transcript: str) -> str:
     Extracts hard facts from the transcript.
     """
     try:
-        facts = extract_hard_facts_with_openai(transcript)
+        facts = extract_hard_facts_with_llm(transcript)
         return facts
     except Exception as e:
         print(f"Error in extract_hard_facts_tool: {e}")
@@ -777,7 +487,45 @@ def extract_financial_advice_tool(transcript: str) -> str:
     Extracts financial advice from the transcript.
     """
     try:
-        advice = extract_financial_advice_with_openai(transcript)
+        advice = extract_financial_advice_with_llm(transcript)
+        return advice
+    except Exception as e:
+        print(f"Error in extract_financial_advice_tool: {e}")
+        return "Error: Failed to extract financial advice."
+
+
+def extract_financial_goals_with_llm(transcript: str) -> list:
+    """Extracts financial goals from a transcript."""
+    prompt = f"""You are an AI assistant tasked with extracting **financial goals** from a transcript.
+
+    Financial goals are:
+    - Stated objectives or aspirations mentioned by the **client**.
+    - Can include saving, investing, retirement planning, debt reduction, homeownership, etc.
+    - Must be **clearly stated by the client**, not inferred or assumed.
+    - **Do not include** financial advice given by the planner.
+
+    Your output must:
+    - Be a **list of financial goals** extracted from the transcript.
+    - Return "None" if no goals are mentioned.
+
+    ### **Transcript:**
+    {transcript}
+
+    ### **Extracted Financial Goals:**
+    - 
+    """
+    response_msg, _ = make_llm_query(prompt=prompt, model_name=SELECTED_MODEL, log_file=LLM_LOG_FILE_NAME)
+    if response_msg.lower() == "none":
+        return []
+    return response_msg
+  
+  
+def extract_financial_goals_tool(transcript: str) -> str:
+    """
+    Extracts financial advice from the transcript.
+    """
+    try:
+        advice = extract_financial_goals_with_llm(transcript)
         return advice
     except Exception as e:
         print(f"Error in extract_financial_advice_tool: {e}")
@@ -835,14 +583,17 @@ def process_audio_segment(chunk: List[Dict], speaker_mapping: Dict[str, str], ag
     financial_advice_input = json.dumps({
         "transcript": all_chunk_text
     })
+    financial_goals_input = json.dumps({
+        "transcript": all_chunk_text
+    })
     # Define the tool inputs
     tool_inputs = {
         "Summarize Transcript": summarize_input,
         "Extract Hard Facts": hard_facts_input,
         "Extract Financial Advice": financial_advice_input,
+        "Extract Financial Goals": financial_goals_input,
     }
 
-    
     results = {}
     # Iterate over each tool and execute its function with appropriate arguments
     for tool in agent.tools:
@@ -857,6 +608,9 @@ def process_audio_segment(chunk: List[Dict], speaker_mapping: Dict[str, str], ag
         except Exception as e:
             print(f"Error running tool '{tool.name}': {e}")
             results[tool.name.lower().replace(" ", "_")] = None
+        
+        # Try stop API rate limits
+        time.sleep(0.1)
 
     return results
 
@@ -872,7 +626,7 @@ def generate_combined_summary(summaries: list) -> str:
     Returns:
     - str: A single cohesive summary.
     """
-    summaries_text = "\n\n".join(summaries)
+    summaries_text = "\n\n".join([s for s in summaries if s is not None])
     # prompt = f"""Combine the following summaries into a cohesive, comprehensive summary of a few sentences long. Text to summarize:
 
     # {summaries_text}
@@ -884,14 +638,14 @@ def generate_combined_summary(summaries: list) -> str:
     Your goal is to:
     - Combine the following summaries into a single, comprehensive summary that captures all the key points.
     - Ensure the final summary is clear, concise, and only a few sentences long.
+    - Remove all instances of 'Errors' or 'None' from the list.
 
     Individual summaries:
     {summaries_text}
 
     Final cohesive summary:
     """
-    response, cost_for_query = make_openai_query(prompt, model_name=OPENAI_MODEL)
-    response_msg = response.choices[0].message.content
+    response_msg, cost_for_query = make_llm_query(prompt=prompt, model_name=SELECTED_MODEL, log_file=LLM_LOG_FILE_NAME)
     return response_msg, cost_for_query
 
 def generate_combined_advice(advice_list: list) -> str:
@@ -907,7 +661,7 @@ def generate_combined_advice(advice_list: list) -> str:
     if len(advice_list) == 0:
         return [], 0
 
-    advice_text = "\n".join(advice_list)
+    advice_text = "\n".join([a for a in advice_list if a is not None])
 
     prompt = f"""You are an AI assistant tasked with deduplicating and consolidating financial advice into a clear, organized list.
 
@@ -915,6 +669,7 @@ def generate_combined_advice(advice_list: list) -> str:
     - Combine the following advice points into a concise and actionable bullet-point list.
     - Deduplicate similar advice and ensure there is no overlap or redundancy.
     - Return the advice in the format: ['Advice 1', 'Advice 2', 'Advice 3'].
+    - Remove all instances of 'Errors' or 'None' from the list.
     - If there is no clear advice, return 'None'.
 
     Advice points to consolidate:
@@ -922,12 +677,47 @@ def generate_combined_advice(advice_list: list) -> str:
 
     Final consolidated advice:
     """
-    response, cost_for_query = make_openai_query(prompt, model_name=OPENAI_MODEL)
-    response_msg = response.choices[0].message.content
+    response_msg, cost_for_query = make_llm_query(prompt=prompt, model_name=SELECTED_MODEL, log_file=LLM_LOG_FILE_NAME)
     if response_msg.lower() == "none":
         return [], 0
     return response_msg, cost_for_query
 
+def generate_combined_goals(goals_list: list) -> str:
+    """
+    Combines financial goals into a concise, deduplicated bullet-point list using OpenAI/Gemini.
+
+    Parameters:
+    - goals_list (list): List of financial goals extracted from chunks.
+
+    Returns:
+    - str: Deduplicated and consolidated financial goals.
+    """
+    if len(goals_list) == 0:
+        return [], 0
+
+    goals_text = "\n".join([g for g in goals_list if g is not None])
+
+    prompt = f"""You are an AI assistant tasked with deduplicating and consolidating financial goals into a clear, organized list.
+
+    Your goal is to:
+    - Combine the following financial goals into a **concise, structured bullet-point list**.
+    - Deduplicate similar goals and ensure there is **no overlap or redundancy**.
+    - Return the goals in the format: **['Goal 1', 'Goal 2', 'Goal 3']**.
+    - Remove all instances of **'Errors' or 'None'** from the list.
+    - If there are no valid financial goals, return **'None'**.
+
+    Financial goals to consolidate:
+    {goals_text}
+
+    Final consolidated financial goals:
+    """
+    
+    response_msg, cost_for_query = make_llm_query(prompt=prompt, model_name=SELECTED_MODEL, log_file=LLM_LOG_FILE_NAME)
+    
+    if response_msg.lower() == "none":
+        return [], 0
+    
+    return response_msg, cost_for_query
 
 def combine_non_empty_sublists(lst):
     combined = [item for sublist in lst if sublist for item in sublist]
@@ -943,21 +733,23 @@ def generate_combined_hard_facts(hard_facts_list: list) -> str:
     Returns:
     - str: Deduplicated and consolidated hard facts as a list.
     """
-    all_hard_facts = combine_non_empty_sublists(hard_facts_list)
+    all_hard_facts = combine_non_empty_sublists([s for s in hard_facts_list if s is not None])
     if len(all_hard_facts) == 0:
         return [], 0
 
     hard_facts_text = "\n".join(all_hard_facts)
 
-    prompt = f"""You are an AI assistant tasked with consolidating and deduplicating a list of hard facts. 
+    prompt = f"""You are an AI assistant tasked with consolidating and deduplicating a list of hard personal and financial facts. 
     A hard fact is a statement of objective truth, free from ambiguity, interpretation, or subjectivity. The hard facts should not be about the conversation that took place, 
-    but rather about the financial information or personal information shared.
+    but rather about the financial information or personal information shared. 
 
     Your goal is to:
     - Extract only hard facts from the provided list, avoiding any overlap or redundancy.
     - Ensure each fact is unique and does not repeat information stated elsewhere in the list.
     - Exclude any subjective opinions, recommendations, or ambiguous statements.
+    - Exclude any factual financial information that is not directly related to the client's personal or financial situation.
     - Present the final output in the format: ['Fact 1', 'Fact 2', 'Fact 3'].
+    - Remove all instances of 'Errors' or 'None' from the list.
     - If no valid hard facts can be extracted, return 'None'.
 
     Hard facts to analyze and consolidate:
@@ -965,9 +757,7 @@ def generate_combined_hard_facts(hard_facts_list: list) -> str:
 
     Final consolidated hard facts:
     """
-    
-    response, cost_for_query = make_openai_query(prompt, model_name=OPENAI_MODEL)
-    response_msg = response.choices[0].message.content
+    response_msg, cost_for_query = make_llm_query(prompt=prompt, model_name=SELECTED_MODEL, log_file=LLM_LOG_FILE_NAME)
     if response_msg.lower() == "none":
         return [], 0
     return response_msg, cost_for_query
@@ -988,23 +778,49 @@ def aggregate_chunk_results(chunk_results: list) -> dict:
     summaries = [chunk["summarize_transcript"] for chunk in chunk_results]
     all_advice = [chunk["extract_financial_advice"] for chunk in chunk_results if chunk["extract_financial_advice"]!= []]
     all_hard_facts_list = [chunk["extract_hard_facts"] for chunk in chunk_results]
-    print("all_hard_facts_list", all_hard_facts_list)
-    # all_goal = [chunk["extract_goals"] for chunk in chunk_results]
+    all_goal = [chunk["extract_financial_goals"] for chunk in chunk_results]
+    print("all_hard_facts_list single entry:\n", all_hard_facts_list[0])
     
     # Generate consolidated outputs
-    final_combined_hard_facts, _ = generate_combined_hard_facts(all_hard_facts_list)  # Optional, can be uncommented later
     final_full_summary, _ = generate_combined_summary(summaries)
-    final_combined_advice, _ = generate_combined_advice(all_advice)  # Optional, can be uncommented later
+    final_combined_advice, _ = generate_combined_advice(all_advice)
+    final_combined_hard_facts, _ = generate_combined_hard_facts(all_hard_facts_list)
+    final_combined_goals, _ = generate_combined_goals(all_goal) 
 
     return {
         "final_full_summary": final_full_summary,
         "final_combined_advice": final_combined_advice,
         "all_hard_facts": final_combined_hard_facts,
-        # "all_goals": all_goals,
+        "all_financial_goals": final_combined_goals,
     }
 
 
+import json
+import tiktoken
+from typing import List
+from collections import Counter
 
+
+
+def classify_roles_with_llm_V2(transcript: str, n_speakers: int, model_name: str) -> dict:
+    """Classifies roles in the transcript, handling token limits and aggregating results."""
+    token_limit = MODEL_TOKEN_LIMITS.get(model_name, 10000)
+    transcript_tokens = count_tokens_func(transcript, model_name)
+    print(f"Total Tokens in transcription: {transcript_tokens}")
+    
+    if transcript_tokens > token_limit:
+        print(f"(ISSUE) Transcript too large ({transcript_tokens} tokens). Just using first chunk...")
+        chunks = split_text_into_chunks(transcript, model_name)
+        selected_chunk = chunks[0]
+        tmp_count = count_tokens_func(selected_chunk, model_name)
+        print(f"(ISSUE) Total Tokens in sub-selected transcription: {tmp_count}")
+    else:
+        selected_chunk = transcript
+
+    classification_output = classify_speakers_api_call(transcript=selected_chunk, n_speakers=n_speakers)
+    return classification_output    
+    
+    
 def generate_speaker_mapping(combined_speaker_segments: List[dict]) -> dict:
     """
     Generates a speaker mapping by classifying roles in the entire transcript.
@@ -1023,13 +839,18 @@ def generate_speaker_mapping(combined_speaker_segments: List[dict]) -> dict:
     print(f"n_speakers: {n_speakers}")
 
     # Classify roles using OpenAI
-    classification_output = classify_roles_with_openai(transcript=transcript_text, n_speakers=n_speakers)
+    # Ensure we select the biggest piece of text which can be used with the model
+    classification_output = classify_roles_with_llm_V2(
+        transcript=transcript_text, n_speakers=n_speakers,
+        model_name=SELECTED_MODEL
+    )
+    print("classification_output", classification_output)
+    return classification_output
 
     # Parse the classification output to generate the speaker mapping
-    speaker_mapping = parse_speaker_mapping(classification_output, combined_speaker_segments)
-    return speaker_mapping
-    
-    
+    # speaker_mapping = parse_speaker_mapping(classification_output, combined_speaker_segments)
+    # return speaker_mapping
+
 
 def create_transcript_output_docx(combined_speaker_segments: List[dict], speaker_mapping: dict, meeting_name: str, fp_name="Morgan", client_name: str = "Client A"):
     """
@@ -1074,7 +895,7 @@ def create_transcript_output_docx(combined_speaker_segments: List[dict], speaker
     document.save(filename)
     print(f"Transcript saved as {filename}")
     
-    
+
 def create_combined_speaker_segments(raw_transcript: dict) -> List[dict]:
     # Combine consecutive segments by the same speaker
     combined_segments = []
@@ -1289,13 +1110,12 @@ def extract_confidence_statistics(raw_transcription: dict):
     }
 
 
-
-DRY_RUN_SYSTEM = False
-
 if __name__ == "__main__":
-
     # Step 1: Initialize clients and managers
-    boto3_client, s3_manager, transcription_manager = initialize_clients()
+    boto3_client, s3_manager, transcription_manager = initialize_clients(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    )
     print(f"Initialized Client Connections Successfully")
     if not DRY_RUN_SYSTEM:
         # Step 2: Upload audio
@@ -1322,27 +1142,24 @@ if __name__ == "__main__":
             raise e
 
     else:
-        job_name = "transcription_job_20250218_173200"
-        s3_output_folder = "other/audio-files/job_1731_18-02-25/output/"
+        job_name = "transcription_job_20250218_215916"
+        s3_output_folder = "other/audio-files/job_2158_18-02-25/output/"
 
     # Step 5: Fetch transcription output
     raw_transcripts = transcription_manager.fetch_transcription_output(job_name, s3_output_folder=s3_output_folder)
     print(f"Successfully fetched raw transcriptions")
-    
+
     confidence_stats = extract_confidence_statistics(raw_transcription=raw_transcripts)
     print("confidence_stats", confidence_stats)
-    
+
     merged_transcripts = merge_transcript_speaker_breaks(raw_transcripts=raw_transcripts)
     combined_speaker_segments = merged_transcripts["audio_segments"]
-    print(combined_speaker_segments)
-    # combined_speaker_segments = create_combined_speaker_segments(raw_transcript=raw_transcripts)
-    # print(combined_speaker_segments)
     
     # Generate Speaker Mapping like so
     speaker_mapping = generate_speaker_mapping(combined_speaker_segments=combined_speaker_segments)
     # speaker_mapping = {'spk_0': 'financial planner', 'spk_1': 'client'}
     print("speaker_mapping:\n", speaker_mapping)    
-    
+        
     meeting_name = "Intro FP Chat with Ryan"
     client_name = "Ryan"
     create_transcript_output_docx(
@@ -1365,9 +1182,12 @@ if __name__ == "__main__":
     
     # Step 3: Process each chunk    
     processed_audio_results = []
-    for audio_segments in transcription_chunks:
-        processed_results = process_audio_segment(chunk=audio_segments, speaker_mapping=speaker_mapping, agent=agent)
+    for i, audio_segments in enumerate(transcription_chunks):
+        processed_results = process_audio_segment(
+            agent=agent,chunk=audio_segments,speaker_mapping=speaker_mapping
+        )
         processed_audio_results.append(processed_results)
+        time.sleep(0.1)
 
     # Step 4: Aggregate the results from all chunks
     final_results = aggregate_chunk_results(processed_audio_results)
@@ -1377,9 +1197,10 @@ if __name__ == "__main__":
     
     # Get full query stats
     stats = cost_tracker.get_query_stats()
+    
+    # Log the final results
+    log_final_results(final_results, stats, log_final_file=FULL_APP_LOG_FILE_NAME)
+
     print("Query Statistics:")
     for key, value in stats.items():
         print(f"{key}: {value}")
-    
-    # Log the final results
-    log_final_results(final_results, stats)

@@ -1,5 +1,8 @@
+
+# TODO: Move logic for calculating cost of queries to this class
+
 class QueryCostTracker:
-    def __init__(self, usd_to_zar_conversion_rate: float = 18.0):
+    def __init__(self, usd_to_zar_conversion_rate: float = 18.0, nth_decimal_point: int = 7):
         """
         Initializes the QueryCostTracker.
         
@@ -8,6 +11,7 @@ class QueryCostTracker:
         """
         self.total_cost_usd = 0.0
         self.query_count = 0
+        self.nth_decimal_point = nth_decimal_point
         self.usd_to_zar_conversion_rate = usd_to_zar_conversion_rate
         self.query_costs = []  # Stores individual query costs for statistics
     
@@ -60,8 +64,8 @@ class QueryCostTracker:
             dict: Dictionary containing total cost, average cost, and total cost in ZAR.
         """
         return {
-            "total_cost_usd": round(self.get_full_amount(), 6),
-            "total_cost_zar": round(self.get_cost_in_rands(), 6),
-            "average_cost_per_query_usd": round(self.get_average_cost_per_query(), 6),
+            "total_cost_usd": round(self.get_full_amount(), self.nth_decimal_point),
+            "total_cost_zar": round(self.get_cost_in_rands(), self.nth_decimal_point),
+            "average_cost_per_query_usd": round(self.get_average_cost_per_query(), self.nth_decimal_point),
             "query_count": self.query_count,
         }
